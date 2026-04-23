@@ -92,5 +92,43 @@ source devel/setup.zsh
 export PATH="/home/daphne/miniconda3/envs/env_franka/bin:$PATH"
 ========================================================================================
 
+
+============================ AGENTPLACE SERVER/CLIENT SETUP ============================
+source ~/archit/ssa_ws/devel/setup.zsh && export PATH="/home/daphne/miniconda3/envs/env_franka/bin:$PATH"
+conda install -c conda-forge zeromq lz4 -y
+cd ~/archit_ws/ssa_ws/src
+git clone https://github.com/youliangtan/agentlace.git
+touch agentlace/CATKIN_IGNORE
+cd ~/archit/ssa_ws/src/agentlace
+pip install -e . --no-deps
+pip install pyzmq lz4 opencv-python-headless
+
+----------------- DEBUGGING REF. -----------------
+pip uninstall numpy -y      # as above command accidently install numpy=2.xx version 
+pip install "numpy==1.26.4"     # roll back to required version
+pip uninstall typing -y         # remove typing if causing error in using 'pip3 show'
+rm /home/daphne/miniconda3/envs/env_franka/lib/python3.9/site-packages/typing.py
+conda update -n base cryptography --no-plugins
+--------------------------------------------------
+
+python -c "from agentlace.action import ActionClient, ActionConfig; print('OK')"
+pip install rosnumpy
+python -c "import numpy; print(numpy.__version__)"  # should be 1.26.4
+
+pip install pyrealsense2
+python -c "import pyrealsense2 as rs; ctx = rs.context(); print(len(ctx.devices), 'device(s) found')"
+
+----------------- DEBUGGING REF. -----------------
+# The PyPI pyrealsense2 wheel bundles its own liblibrealsense2 but still expects libudev.so.0 from the system.
+# On Ubuntu 22 the file is libudev.so.1 -> the .so.0 symlink is missing.
+ls /lib/x86_64-linux-gnu/libudev.so*    # shows libudev.so.1  (but not .so.0)
+
+# creating the missing link
+sudo ln -s /lib/x86_64-linux-gnu/libudev.so.1 /lib/x86_64-linux-gnu/libudev.so.0
+python -c "import pyrealsense2 as rs; ctx = rs.context(); print(len(ctx.devices), 'device(s) found')"
+--------------------------------------------------
+========================================================================================
+
+
 # TO ACTIVATE AND SOURCE THE ENVIRONMENT
 conda activate env_franka && source ~/archit/ssa_ws/devel/setup.zsh && export PATH="/home/daphne/miniconda3/envs/env_franka/bin:$PATH"
