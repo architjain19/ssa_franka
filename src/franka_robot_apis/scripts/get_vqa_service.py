@@ -2,8 +2,6 @@
 """
 ROS1 Noetic service node that provides a vision-language query interface using Qwen2.5-VL.
 
-Ported from the ROS2 Humble implementation — identical service contract.
-
 Service: /robot/perception/get_vqa_response  (robot_api_interfaces/RobotCommand)
 
 Request JSON format:
@@ -137,7 +135,7 @@ class QwenVLServiceNode:
     """
     ROS1 service node wrapping a Qwen2.5-VL vLLM server.
 
-    Mirrors the ROS2 QwenVLServiceNode architecture:
+    QwenVLServiceNode architecture:
       - Subscribes to a configurable camera topic (lazy, on demand)
       - Caches the latest frame with a staleness timeout
       - Exposes /robot/perception/get_vqa_response (RobotCommand.srv)
@@ -145,7 +143,7 @@ class QwenVLServiceNode:
 
     def __init__(self):
         # ------------------------------------------------------------------
-        # ROS1 Parameters  (ros2 declare_parameter -> rospy.get_param)
+        # ROS1 Parameters  (rospy.get_param)
         # ------------------------------------------------------------------
         self.qwen_host           = rospy.get_param("~qwen_host",          "10.158.54.164")
         self.qwen_port           = rospy.get_param("~qwen_port",          8000)
@@ -372,7 +370,7 @@ class QwenVLServiceNode:
         return response
 
     # ------------------------------------------------------------------
-    # Qwen VL inference  (identical to ROS2 version)
+    # Qwen VL inference
     # ------------------------------------------------------------------
 
     def _query_qwen(self, prompt, b64_image, max_tokens, temperature):
