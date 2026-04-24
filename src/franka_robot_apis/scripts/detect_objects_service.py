@@ -25,7 +25,7 @@ ROS1 usage:
     rosrun <your_pkg> detect_objects_service_node_ros1.py
 
     rosservice call /robot/perception/detect_objects \
-        '{"req": "{\"text_prompt\": \"purple floor\"}"}'
+        '{"req": "{\"text_prompt\": \"floor\"}"}'
 """
 
 import json
@@ -176,8 +176,6 @@ class SegmentAndGraspNode:
         # ------------------------------------------------------------------ #
         #  Subscriptions                                                       #
         # ------------------------------------------------------------------ #
-        # ROS1: no QoSProfile object — use queue_size=1 + large buff_size
-        # to approximate BEST_EFFORT / keep only the latest frame.
         rospy.Subscriber(
             self.rgb_topic, Image, self._rgb_cb,
             queue_size=1, buff_size=2 ** 24,
@@ -653,7 +651,7 @@ class SegmentAndGraspNode:
 
 
 def main():
-    """Initialize and spin the SegmentAndGraspNode (ROS1 Noetic)."""
+    """Initialize and spin the SegmentAndGraspNode."""
     rospy.init_node("detect_objects_service", anonymous=False)
 
     try:
