@@ -16,6 +16,8 @@ Example service requests:
   rosservice call /robot/control/move_ee_to_rel_pose \
     "req: '{\"delta_position\": {\"x\": 0.0, \"y\": 0.1, \"z\": 0.3}}'"
 
+  rosservice call /robot/control/reset_robot "{}" 
+
 Features:
 - Blocks until robot reaches target (within tolerance)
 - Monitors progress via /franka_state_controller/franka_states
@@ -26,7 +28,7 @@ import json
 import math
 import rospy
 from geometry_msgs.msg import PoseStamped
-from robot_api_interfaces.srv import RobotCommand, RobotCommandResponse
+from robot_api_interfaces.srv import RobotCommand, RobotCommandResponse, RobotQuery, RobotQueryResponse
 from robot_api_interfaces.msg import ResultCode
 from franka_msgs.msg import FrankaState
 
@@ -60,6 +62,10 @@ class MoveEEControllerNode:
         self.is_moving = False
         self.target_pose = None
         self.movement_start_time = None
+        self.reset_robot_pose_config = {
+            "position": {"x": 0.5, "y": 0.0, "z": 0.5},
+            "orientation": {"x": 0.8722, "y": -0.4867, "z": -0.0424, "w": 0.0264},
+        }
 
         # Services
         self.move_to_pose_service = rospy.Service(
@@ -69,11 +75,16 @@ class MoveEEControllerNode:
         self.move_to_rel_pose_service = rospy.Service(
             "/robot/control/move_ee_to_rel_pose", RobotCommand,
             self._handle_move_ee_to_rel_pose)
+        
+        self.reset_robot_service = rospy.Service(
+            "/robot/control/reset_robot", RobotQuery,
+            self._handle_reset_robot)
 
         rospy.loginfo(
             f"Services initialized. Publishing to: {self.equilibrium_pose_topic}\n"
             f"  /robot/control/move_ee_to_pose\n"
-            f"  /robot/control/move_ee_to_rel_pose"
+            f"  /robot/control/move_ee_to_rel_pose\n"
+            f"  /robot/control/reset_robot"
         )
 
     # -------------------------------------------------------------------------
@@ -367,6 +378,48 @@ class MoveEEControllerNode:
 
         return response
 
+    # -------------------------------------------------------------------------
+    # /robot/control/reset_robot  (absolute pose)
+    # -------------------------------------------------------------------------
+
+    def _handle_reset_robot(self, req):
+        response = RobotQueryResponse()
+
+        try:
+            reset_robot_pose = self.reset_robot_pose_config
+
+            # Type validation
+            for a in ["x", "y", "z"]:
+                if not isinstance(reset_robot_pose["position"][a], (int, float)):
+                    raise ValueError(f"Invalid position {a}")
+            for a in ["x", "y", "z", "w"]:
+                if not isinstance(reset_robot_pose["orientation"][a], (int, float)):
+                    raise ValueError(f"Invalid orientation {a}")
+
+            if not self.has_received_data:
+                response.result_code.result_code = ResultCode.SERVICE_NOT_RUNNING
+                response.result_code.message = "Robot not connected"
+                response.data = json.dumps({"success": False, "error": "Robot not connected"})
+                return response
+
+            command_res = self._execute_move_to_pose(reset_robot_pose)
+            response = RobotQueryResponse()     # Converting RobotCommandResponse to RobotQueryResponse
+            response.result_code = command_res.result_code
+            response.data = command_res.data
+            return response
+
+        except ValueError as e:
+            response.result_code.result_code = ResultCode.INVALID_INPUT
+            response.result_code.message = str(e)
+            response.data = json.dumps({"success": False, "error": str(e)})
+        except Exception as e:
+            self.is_moving = False
+            self.target_pose = None
+            response.result_code.result_code = ResultCode.FAILURE
+            response.result_code.message = str(e)
+            response.data = json.dumps({"success": False, "error": str(e)})
+
+        return response
 
 def main():
     try:
