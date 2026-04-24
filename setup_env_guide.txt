@@ -127,6 +127,8 @@ ls /lib/x86_64-linux-gnu/libudev.so*    # shows libudev.so.1  (but not .so.0)
 sudo ln -s /lib/x86_64-linux-gnu/libudev.so.1 /lib/x86_64-linux-gnu/libudev.so.0
 python -c "import pyrealsense2 as rs; ctx = rs.context(); print(len(ctx.devices), 'device(s) found')"
 --------------------------------------------------
+
+pip install openai
 ========================================================================================
 
 
