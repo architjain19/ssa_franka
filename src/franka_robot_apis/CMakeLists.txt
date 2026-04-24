@@ -171,6 +171,7 @@ catkin_install_python(PROGRAMS
   scripts/_test_python_node.py
   scripts/get_current_robot_state_service.py
   scripts/move_ee_controller_node.py
+  scripts/move_ee_guarded_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
