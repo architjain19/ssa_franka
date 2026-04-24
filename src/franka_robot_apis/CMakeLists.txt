@@ -169,6 +169,7 @@ target_link_libraries(_test_cpp_node ${catkin_LIBRARIES})
 # )
 catkin_install_python(PROGRAMS
   scripts/_test_python_node.py
+  scripts/get_current_robot_state_service.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
