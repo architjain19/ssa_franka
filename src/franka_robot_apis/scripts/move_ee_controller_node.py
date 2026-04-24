@@ -43,7 +43,7 @@ class MoveEEControllerNode:
             "/cartesian_impedance_controller/equilibrium_pose"
         )
         self.publish_rate = rospy.get_param("~publish_rate", 20)
-        self.execution_timeout = rospy.get_param("~execution_timeout", 30.0)
+        self.execution_timeout = rospy.get_param("~execution_timeout", 20.0)
         self.position_tolerance = rospy.get_param("~position_tolerance", 0.01)
         self.orientation_tolerance = rospy.get_param("~orientation_tolerance", 0.05)
 
