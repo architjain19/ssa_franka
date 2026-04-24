@@ -173,6 +173,7 @@ catkin_install_python(PROGRAMS
   scripts/move_ee_controller_node.py
   scripts/move_ee_guarded_node.py
   scripts/get_vqa_service.py
+  scripts/detect_objects_service.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

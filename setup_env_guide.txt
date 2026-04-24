@@ -129,6 +129,7 @@ python -c "import pyrealsense2 as rs; ctx = rs.context(); print(len(ctx.devices)
 --------------------------------------------------
 
 pip install openai
+pip install aiohttp
 ========================================================================================
 
 
