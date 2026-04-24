@@ -1,0 +1,4 @@
+# RobotQuery.srv
+---
+robot_api_interfaces/ResultCode result_code
+string data                                     # JSON-encoded payload

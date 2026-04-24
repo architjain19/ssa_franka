@@ -1,0 +1,5 @@
+# RobotCommand.srv
+string req                                      # JSON-encoded input payload
+---
+robot_api_interfaces/ResultCode result_code
+string data                                     # JSON-encoded output payload
