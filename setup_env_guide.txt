@@ -133,5 +133,50 @@ pip install aiohttp
 ========================================================================================
 
 
+=============================== ROBOTIQ 2F GRIPPER SETUP ===============================
+
+cd ~/archit_ws/ssa_ws/src
+git clone https://github.com/ros-industrial-attic/robotiq       # branch: kinetic-devel
+git clone https://github.com/mgruhler/soem.git                  # branch: melodic
+
+----------------- DEBUGGING REF. -----------------
+# Perform python3 indentation corrections to following file
+/home/daphne/archit/ssa_ws/src/robotiq/robotiq_modbus_rtu/src/robotiq_modbus_rtu/comModbusRtu.py
+/home/daphne/archit/ssa_ws/src/robotiq/robotiq_2f_gripper_control/src/robotiq_2f_gripper_control/baseRobotiq2FGripper.py
+--------------------------------------------------
+
+git clone https://github.com/ros-industrial/ros_canopen.git     # branch: noetic
+
+# IGNORE irrelevant package
+touch ~/archit/ssa_ws/src/ros_canopen/canopen_chain_node/CATKIN_IGNORE
+touch ~/archit/ssa_ws/src/ros_canopen/canopen_master/CATKIN_IGNORE
+touch ~/archit/ssa_ws/src/ros_canopen/canopen_motor_node/CATKIN_IGNORE
+touch ~/archit/ssa_ws/src/ros_canopen/canopen_402/CATKIN_IGNORE
+touch ~/archit/ssa_ws/src/ros_canopen/socketcan_bridge/CATKIN_IGNORE
+touch ~/archit/ssa_ws/src/robotiq/robotiq_3f_gripper_articulated_gazebo/CATKIN_IGNORE
+touch ~/archit/ssa_ws/src/robotiq/robotiq_3f_gripper_articulated_gazebo_plugins/CATKIN_IGNORE
+touch ~/archit/ssa_ws/src/robotiq/robotiq_3f_rviz/CATKIN_IGNORE
+
+pip install pymodbus==2.5.3
+
+catkin_make
+
+----------------- NOTES -----------------
+# Use this to run gripper node
+rosrun robotiq_2f_gripper_control Robotiq2FGripperRtuNode.py /dev/ttyUSB1
+# If got permission issues, then-
+sudo chmod 666 /dev/ttyUSB1
+# or add your user to the dialout group permanently
+sudo usermod -a -G dialout $USER
+
+# To fully open the gripper do this-
+rostopic pub /Robotiq2FGripperRobotOutput robotiq_2f_gripper_control/Robotiq2FGripper_robot_output "{rACT: 1, rGTO: 1, rATR: 0, rPR: 0, rSP: 255, rFR: 150}" --once
+# To fully close the gripper do this-
+rostopic pub /Robotiq2FGripperRobotOutput robotiq_2f_gripper_control/Robotiq2FGripper_robot_output "{rACT: 1, rGTO: 1, rATR: 0, rPR: 255, rSP: 255, rFR: 150}" --once
+--------------------------------------------------
+
+========================================================================================
+
+
 # TO ACTIVATE AND SOURCE THE ENVIRONMENT
 conda activate env_franka && source ~/archit/ssa_ws/devel/setup.zsh && export PATH="/home/daphne/miniconda3/envs/env_franka/bin:$PATH"
