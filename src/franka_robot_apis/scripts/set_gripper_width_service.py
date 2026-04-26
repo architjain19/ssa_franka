@@ -2,8 +2,12 @@
 """
 ROS1 Noetic service node: Robotiq 2F Gripper Width Control
 -----------------------------------------------------------
-Service: /robot/control/set_gripper_width  (robot_api_interfaces/RobotCommand)
+Services
+--------
+1. /robot/control/set_gripper_width                    (robot_api_interfaces/RobotCommand)
+2. /robot/proprioception/get_gripper_width     (robot_api_interfaces/RobotQuery)
 
+--- set_gripper_width ---
 Request (JSON string in .req field):
 {
     "width": 0.04,               # target opening width in metres (required)
@@ -21,11 +25,22 @@ Response (JSON string in .data field):
         "target_pr":        120,
         "final_pr":         118,
         "final_width_m":    0.0407,
-        "duration_seconds": 2.0,
+        "duration_seconds": 3.0,
         "speed":            255,
         "force":            150,
         "status":           "reached"
     }
+}
+
+--- get_gripper_width ---
+Request: empty  (RobotQuery has no request fields)
+
+Response (JSON string in .data field):
+{
+    "gripper_width":         0.042,
+    "units":                 "meters",
+    "left_finger_position":  0.021,
+    "right_finger_position": 0.021
 }
 
 Robotiq 2F-85 physical limits (adjustable via ROS params):
@@ -38,6 +53,8 @@ ROS1 usage:
 
     rosservice call /robot/control/set_gripper_width \
         '{"req": "{\"width\": 0.04}"}'
+
+    rosservice call /robot/proprioception/get_gripper_width '{}'
 
 Gripper topics:
     Publish  : /Robotiq2FGripperRobotOutput  (command)
@@ -55,7 +72,10 @@ from robotiq_2f_gripper_control.msg import (
     Robotiq2FGripper_robot_output as OutputMsg,
     Robotiq2FGripper_robot_input  as InputMsg,
 )
-from robot_api_interfaces.srv import RobotCommand, RobotCommandResponse
+from robot_api_interfaces.srv import (
+    RobotCommand,  RobotCommandResponse,
+    RobotQuery,    RobotQueryResponse,
+)
 from robot_api_interfaces.msg import ResultCode
 
 
@@ -132,15 +152,22 @@ class SetGripperWidthNode:
         # ------------------------------------------------------------------ #
         #  Service                                                             #
         # ------------------------------------------------------------------ #
-        self._service = rospy.Service(
+        self._set_width_service = rospy.Service(
             "/robot/control/set_gripper_width",
             RobotCommand,
-            self._handle_request,
+            self._handle_set_width,
+        )
+
+        self._get_width_service = rospy.Service(
+            "/robot/proprioception/get_gripper_width",
+            RobotQuery,
+            self._handle_get_width,
         )
 
         rospy.loginfo(
             "\nSetGripperWidthNode (ROS1) ready.\n"
-            f"  Service      : /robot/control/set_gripper_width\n"
+            f"  Service (set): /robot/control/set_gripper_width\n"
+            f"  Service (get): /robot/proprioception/get_gripper_width\n"
             f"  Output topic : {self.output_topic}\n"
             f"  Input  topic : {self.input_topic}\n"
             f"  Width range  : {self.min_width_m*1000:.1f} mm (rPR=255, closed)"
@@ -237,7 +264,7 @@ class SetGripperWidthNode:
 
     def _pr_to_width(self, pr):
         """
-        Map an rPR byte (0-255) -> width in metres.
+        Map an rPR byte (0–255) → width in metres.
 
         Args:
             pr (int): rPR value
@@ -249,12 +276,12 @@ class SetGripperWidthNode:
         return self.max_width_m - ratio * (self.max_width_m - self.min_width_m)
 
     # ------------------------------------------------------------------ #
-    #  Service handler                                                     #
+    #  Service handler: set_gripper_width                                  #
     # ------------------------------------------------------------------ #
 
-    def _handle_request(self, request):
+    def _handle_set_width(self, request):
         """
-        rospy.Service callback - each call runs in its own thread.
+        rospy.Service callback for /robot/control/set_gripper_width.
 
         Args:
             request (RobotCommand.Request): .req holds the JSON string
@@ -371,6 +398,70 @@ class SetGripperWidthNode:
         response.result_code.result_code = ResultCode.SUCCESS if success else ResultCode.FAILURE
         response.result_code.message     = message
         response.data                    = json.dumps(payload)
+        return response
+
+    # ------------------------------------------------------------------ #
+    #  Service handler: get_gripper_width                          #
+    # ------------------------------------------------------------------ #
+
+    def _handle_get_width(self, request):
+        """
+        rospy.Service callback for /robot/proprioception/get_gripper_width.
+
+        Reads gPO (current position echo, 0-255) from the latest gripper
+        feedback message and converts it to metres using the same linear
+        mapping as _pr_to_width.
+
+        The Robotiq 2F has two symmetric fingers, so each finger travels
+        half the total width from the centreline.
+
+        Args:
+            request (RobotQuery.Request): no fields
+
+        Returns:
+            RobotQueryResponse
+        """
+        rospy.loginfo("get_gripper_width request received.")
+        response = RobotQueryResponse()
+
+        inp = self._get_latest_input()
+
+        if inp is None:
+            rospy.logwarn(
+                "No feedback received from gripper input topic yet. "
+                f"Is '{self.input_topic}' publishing?"
+            )
+            response.result_code.result_code = ResultCode.FAILURE
+            response.result_code.message     = "No gripper feedback available."
+            response.data = json.dumps({
+                "gripper_width":         None,
+                "units":                 "meters",
+                "left_finger_position":  None,
+                "right_finger_position": None,
+                "error":                 "No feedback received from gripper input topic.",
+            })
+            return response
+
+        current_pr    = int(inp.gPO)   # gPO: current position echo (0-255)
+        gripper_width = self._pr_to_width(current_pr)
+
+        # Each finger moves symmetrically - half of total width from centre
+        finger_pos = gripper_width / 2.0
+
+        rospy.loginfo(
+            f"Current gripper state: gPO={current_pr}  "
+            f"width={gripper_width*1000:.2f} mm  "
+            f"finger_pos={finger_pos*1000:.2f} mm each"
+        )
+
+        response.result_code.result_code = ResultCode.SUCCESS
+        response.result_code.message     = "Successfully retrieved gripper width"
+        response.data = json.dumps({
+            "gripper_width":         round(gripper_width, 3),
+            "units":                 "meters",
+            "left_finger_position":  round(finger_pos, 9),
+            "right_finger_position": round(finger_pos, 9),
+        })
         return response
 
     # ------------------------------------------------------------------ #
