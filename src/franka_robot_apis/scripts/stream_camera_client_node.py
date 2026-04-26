@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
 agentlace_realsense_ros_client.py
-ROS1 client - no cv_bridge, robust publisher with proper ROS1 patterns.
+ROS1 client — publishes calibrated intrinsics, aligned depth, and extrinsics TF.
+
+Changes from original:
+  - depth_aligned: published as a separate topic (aligned to color frame)
+  - Calibrated intrinsics: handles both factory ("coeffs") and calibrated
+    ("dist_coeffs") keys from the server
+  - Extrinsics: broadcast as a TF static transform for the calibrated camera
 """
 
 import argparse
@@ -11,32 +17,36 @@ import numpy as np
 import rospy
 from std_msgs.msg import Header
 from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import TransformStamped
+import tf2_ros
 
 from agentlace.action import ActionClient, ActionConfig
 
 # ── Camera serials ────────────────────────────────────────────────────────────
-SERIALS = ["123622270802", "947122060531", "032522250211"]
+SERIALS = ["123622270802", "032522250211"]
+CALIBRATED_SERIAL = "032522250211"   # eye-in-hand camera with calibrated intrinsics
 
 observation_keys = []
 for s in SERIALS:
     observation_keys += [
         f"cam_{s}_color",
         f"cam_{s}_depth",
+        f"cam_{s}_depth_aligned",
         f"cam_{s}_color_info",
         f"cam_{s}_depth_info",
     ]
+    if s == CALIBRATED_SERIAL:
+        observation_keys.append(f"cam_{s}_extrinsics")
+
 action_keys = ["command"]
 
-QUEUE_SIZE_IMAGE = 1       # latest frame only - drop stale images
-QUEUE_SIZE_INFO  = 10      # small msg, keep a buffer so it's never lost
-
-# latch=True on camera_info means late-joining subscribers get the last
-# published info immediately - important for tools like image_proc.
+QUEUE_SIZE_IMAGE = 1
+QUEUE_SIZE_INFO  = 10
 LATCH_INFO = True
 
 # ── Reconnect settings ────────────────────────────────────────────────────────
-MAX_CONSECUTIVE_NONE = 30   # warn after this many consecutive None obs
-RECONNECT_AFTER_NONE = 100  # attempt reconnect after this many
+MAX_CONSECUTIVE_NONE = 30
+RECONNECT_AFTER_NONE = 100
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -46,42 +56,40 @@ RS_MODEL_TO_ROS = {
     "distortion.kannala_brandt4":       "fisheye",
     "distortion.fov":                   "plumb_bob",
     "distortion.none":                  "plumb_bob",
+    # Calibrated intrinsics use these model names directly
+    "plumb_bob":                        "plumb_bob",
+    "rational_polynomial":              "rational_polynomial",
 }
+
 
 def rs_model_to_ros(model_str: str) -> str:
     return RS_MODEL_TO_ROS.get(model_str, "plumb_bob")
 
+
 def numpy_to_image_msg(arr: np.ndarray, encoding: str,
                         frame_id: str, stamp) -> Image:
-    """
-    Equivalent to cv_bridge for bgr8 and 16UC1.
-    bgr8  : uint8  H x W x 3,  step = W*3
-    16UC1 : uint16 H x W,      step = W*2
-    """
     msg = Image()
     msg.header = Header(stamp=stamp, frame_id=frame_id)
     msg.height = arr.shape[0]
     msg.width  = arr.shape[1]
     msg.encoding     = encoding
-    msg.is_bigendian = False   # x86/ARM are little-endian
+    msg.is_bigendian = False
 
     if encoding == "bgr8":
         assert arr.ndim == 3 and arr.shape[2] == 3, \
             f"Expected HxWx3 for bgr8, got {arr.shape}"
         msg.step = arr.shape[1] * 3
-        # Ensure contiguous memory before tobytes (agentlace may return non-contiguous views)
         msg.data = np.ascontiguousarray(arr, dtype=np.uint8).tobytes()
-
     elif encoding == "16UC1":
         assert arr.ndim == 2, \
             f"Expected HxW for 16UC1, got {arr.shape}"
         msg.step = arr.shape[1] * 2
         msg.data = np.ascontiguousarray(arr, dtype=np.uint16).tobytes()
-
     else:
         raise ValueError(f"Unsupported encoding: {encoding}")
 
     return msg
+
 
 def build_camera_info(info_dict: dict, frame_id: str, stamp) -> CameraInfo:
     ci = CameraInfo()
@@ -93,15 +101,45 @@ def build_camera_info(info_dict: dict, frame_id: str, stamp) -> CameraInfo:
     ci.K = [fx,  0., cx,
              0., fy, cy,
              0.,  0., 1.]
-    ci.R = [1., 0., 0.,   # identity - no rectification for raw streams
+    ci.R = [1., 0., 0.,
             0., 1., 0.,
             0., 0., 1.]
     ci.P = [fx,  0., cx, 0.,
              0., fy, cy, 0.,
              0.,  0., 1., 0.]
-    ci.D = list(info_dict.get("coeffs", [0., 0., 0., 0., 0.]))
-    ci.distortion_model = rs_model_to_ros(info_dict.get("model", ""))
+
+    # Handle both factory format ("coeffs") and calibrated format ("dist_coeffs")
+    coeffs = info_dict.get("dist_coeffs",
+                           info_dict.get("coeffs",
+                                         [0., 0., 0., 0., 0.]))
+    ci.D = list(coeffs)
+
+    model = info_dict.get("model", "")
+    ci.distortion_model = rs_model_to_ros(model)
     return ci
+
+
+def extrinsics_to_tf(ext_dict: dict, parent_frame: str, child_frame: str,
+                     stamp) -> TransformStamped:
+    """Convert the extrinsics dict from the server into a TF message."""
+    t = TransformStamped()
+    t.header.stamp    = stamp
+    t.header.frame_id = parent_frame
+    t.child_frame_id  = child_frame
+
+    pos = ext_dict["position_xyz"]
+    t.transform.translation.x = pos[0]
+    t.transform.translation.y = pos[1]
+    t.transform.translation.z = pos[2]
+
+    q = ext_dict["quat_xyzw"]
+    t.transform.rotation.x = q[0]
+    t.transform.rotation.y = q[1]
+    t.transform.rotation.z = q[2]
+    t.transform.rotation.w = q[3]
+
+    return t
+
 
 def make_publishers(serials):
     pubs = {}
@@ -109,20 +147,29 @@ def make_publishers(serials):
         base = f"/realsense/{s}"
         pubs[s] = {
             "color_img":  rospy.Publisher(
-                f"{base}/color/image_raw",   Image,
+                f"{base}/color/image_raw", Image,
                 queue_size=QUEUE_SIZE_IMAGE),
             "color_info": rospy.Publisher(
                 f"{base}/color/camera_info", CameraInfo,
                 queue_size=QUEUE_SIZE_INFO, latch=LATCH_INFO),
             "depth_img":  rospy.Publisher(
-                f"{base}/depth/image_raw",   Image,
+                f"{base}/depth/image_raw", Image,
                 queue_size=QUEUE_SIZE_IMAGE),
             "depth_info": rospy.Publisher(
                 f"{base}/depth/camera_info", CameraInfo,
                 queue_size=QUEUE_SIZE_INFO, latch=LATCH_INFO),
+            # Aligned depth: same resolution + frame as color
+            "depth_aligned_img": rospy.Publisher(
+                f"{base}/aligned_depth_to_color/image_raw", Image,
+                queue_size=QUEUE_SIZE_IMAGE),
+            "depth_aligned_info": rospy.Publisher(
+                f"{base}/aligned_depth_to_color/camera_info", CameraInfo,
+                queue_size=QUEUE_SIZE_INFO, latch=LATCH_INFO),
         }
-        rospy.loginfo(f"Advertising {base}/{{color,depth}}/...")
+        rospy.loginfo(
+            f"Advertising {base}/{{color,depth,aligned_depth_to_color}}/...")
     return pubs
+
 
 def make_client(ip, port):
     config = ActionConfig(
@@ -132,11 +179,16 @@ def make_client(ip, port):
     )
     return ActionClient(ip, config=config)
 
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip",   default="localhost")
     parser.add_argument("--port", type=int, default=6379)
+    parser.add_argument("--base-frame", default="panda_link0",
+                        help="TF parent frame for extrinsics")
+    parser.add_argument("--camera-frame", default="camera_color_optical_frame",
+                        help="TF child frame for extrinsics")
     args, _ = parser.parse_known_args()
 
     rospy.init_node("agentlace_realsense_client", anonymous=False)
@@ -145,25 +197,28 @@ def main():
     client = make_client(args.ip, args.port)
     pubs   = make_publishers(SERIALS)
 
-    # Cache intrinsics - persist across frames, only update when server sends them
+    # TF broadcaster for extrinsics
+    tf_broadcaster = tf2_ros.StaticTransformBroadcaster()
+    extrinsics_published = False
+
+    # Cache intrinsics — persist across frames
     info_cache = {s: {"color": None, "depth": None} for s in SERIALS}
 
     # Diagnostics
     none_count  = 0
     frame_count = 0
     t_last_log  = time.time()
-    LOG_INTERVAL = 10.0   # log fps every N seconds
+    LOG_INTERVAL = 10.0
 
-    # No Rate() here - publish as fast as server sends, don't artificially cap
     while not rospy.is_shutdown():
         obs = client.obs()
 
-        # ── Handle None (server not ready / network hiccup) ───────────────────
+        # ── Handle None ───────────────────────────────────────────────────────
         if obs is None:
             none_count += 1
             if none_count == MAX_CONSECUTIVE_NONE:
                 rospy.logwarn(
-                    f"Received {none_count} consecutive None observations - "
+                    f"Received {none_count} consecutive None observations — "
                     f"is the server running at {args.ip}:{args.port}?"
                 )
             if none_count >= RECONNECT_AFTER_NONE:
@@ -189,11 +244,25 @@ def main():
             frame_count = 0
             t_last_log  = now
 
+        # ── Extrinsics → TF (publish once, it's static) ──────────────────────
+        if not extrinsics_published:
+            ext = obs.get(f"cam_{CALIBRATED_SERIAL}_extrinsics")
+            if ext is not None and isinstance(ext, dict):
+                tf_msg = extrinsics_to_tf(
+                    ext, args.base_frame, args.camera_frame, stamp)
+                tf_broadcaster.sendTransform(tf_msg)
+                pos = ext["position_xyz"]
+                rospy.loginfo(
+                    f"Published static TF: {args.base_frame} → "
+                    f"{args.camera_frame}  "
+                    f"pos=[{pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f}]")
+                extrinsics_published = True
+
         # ── Per-camera publish ────────────────────────────────────────────────
         for serial in SERIALS:
             p = pubs[serial]
 
-            # Update intrinsics cache (only when server sends - not every frame)
+            # Update intrinsics cache
             c_info = obs.get(f"cam_{serial}_color_info")
             d_info = obs.get(f"cam_{serial}_depth_info")
             if c_info:
@@ -204,7 +273,7 @@ def main():
             color_fid = f"cam_{serial}_color_optical_frame"
             depth_fid = f"cam_{serial}_depth_optical_frame"
 
-            # Color
+            # ── Color ─────────────────────────────────────────────────────────
             color = obs.get(f"cam_{serial}_color")
             if color is not None and isinstance(color, np.ndarray):
                 try:
@@ -217,7 +286,7 @@ def main():
                 except Exception as e:
                     rospy.logerr(f"[{serial}] color publish error: {e}")
 
-            # Depth
+            # ── Raw depth (native resolution, depth sensor frame) ─────────────
             depth = obs.get(f"cam_{serial}_depth")
             if depth is not None and isinstance(depth, np.ndarray):
                 try:
@@ -229,6 +298,24 @@ def main():
                                 info_cache[serial]["depth"], depth_fid, stamp))
                 except Exception as e:
                     rospy.logerr(f"[{serial}] depth publish error: {e}")
+
+            # ── Aligned depth (color resolution, color frame) ─────────────────
+            depth_aligned = obs.get(f"cam_{serial}_depth_aligned")
+            if depth_aligned is not None and isinstance(depth_aligned, np.ndarray):
+                try:
+                    # Aligned depth lives in the COLOR frame — use color_fid
+                    # and color intrinsics, since each pixel corresponds to the
+                    # same (u,v) in the color image.
+                    p["depth_aligned_img"].publish(
+                        numpy_to_image_msg(
+                            depth_aligned, "16UC1", color_fid, stamp))
+                    if info_cache[serial]["color"]:
+                        p["depth_aligned_info"].publish(
+                            build_camera_info(
+                                info_cache[serial]["color"], color_fid, stamp))
+                except Exception as e:
+                    rospy.logerr(f"[{serial}] depth_aligned publish error: {e}")
+
 
 if __name__ == "__main__":
     try:
