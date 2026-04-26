@@ -1,0 +1,28 @@
+<launch>
+  <!-- Franka Impedance Controller -->
+  <include file="$(find serl_franka_controllers)/launch/impedance.launch">
+    <arg name="robot_ip" value="172.16.0.2" />
+    <arg name="load_gripper" value="false" />
+  </include>
+
+  <!-- Static Transform Publisher -->
+  <node pkg="tf2_ros" type="static_transform_publisher" name="camera_to_panda_tf" 
+        args="0 0 0 0 0 0 1 cam_947122060531_depth_optical_frame panda_link0" />
+
+  <!-- Robotiq Gripper Node -->
+  <node pkg="robotiq_2f_gripper_control" type="Robotiq2FGripperRtuNode.py" name="robotiq_gripper" 
+        args="/dev/ttyUSB1" output="screen" />
+
+  <!-- Stream Camera ROS Client Node -->
+  <node pkg="franka_robot_apis" type="stream_camera_client_node.py" name="stream_camera_client" output="screen" />
+
+  <!-- franka_robot_apis Nodes -->
+  <!-- <node pkg="franka_robot_apis" type="get_current_robot_state_service.py" name="robot_state_service" output="screen" />
+  <node pkg="franka_robot_apis" type="move_ee_controller_node.py" name="ee_controller" output="screen" />
+  <node pkg="franka_robot_apis" type="move_ee_guarded_node.py" name="ee_guarded_node" output="screen" />
+  <node pkg="franka_robot_apis" type="get_vqa_service.py" name="vqa_service" output="screen" />
+  <node pkg="franka_robot_apis" type="detect_objects_service.py" name="object_detection_service" output="screen" />
+  <node pkg="franka_robot_apis" type="get_object_mask_service.py" name="object_mask_service" output="screen" />
+  <node pkg="franka_robot_apis" type="set_gripper_width_service.py" name="gripper_width_service" output="screen" /> -->
+
+</launch>
