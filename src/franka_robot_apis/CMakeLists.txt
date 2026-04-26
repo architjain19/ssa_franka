@@ -176,6 +176,7 @@ catkin_install_python(PROGRAMS
   scripts/detect_objects_service.py
   scripts/get_object_mask_service.py
   scripts/stream_camera_client_node.py
+  scripts/set_gripper_width_service.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
