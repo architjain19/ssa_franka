@@ -175,6 +175,7 @@ catkin_install_python(PROGRAMS
   scripts/get_vqa_service.py
   scripts/detect_objects_service.py
   scripts/get_object_mask_service.py
+  scripts/stream_camera_client_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
