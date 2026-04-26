@@ -187,7 +187,7 @@ def main():
     parser.add_argument("--port", type=int, default=6379)
     parser.add_argument("--base-frame", default="panda_link0",
                         help="TF parent frame for extrinsics")
-    parser.add_argument("--camera-frame", default="camera_color_optical_frame",
+    parser.add_argument("--camera-frame", default="cam_032522250211_depth_optical_frame",
                         help="TF child frame for extrinsics")
     args, _ = parser.parse_known_args()
 

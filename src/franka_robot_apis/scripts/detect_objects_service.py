@@ -136,9 +136,9 @@ class SegmentAndGraspNode:
         self.anygrasp_url  = rospy.get_param("~anygrasp_url", "ws://10.158.54.164:8767/get_saved_grasp")
 
         # Camera topics — updated to the robot's actual RealSense topics
-        self.rgb_topic         = rospy.get_param("~rgb_topic",         "/realsense/947122060531/color/image_raw")
-        self.depth_topic       = rospy.get_param("~depth_topic",       "/realsense/947122060531/depth/image_raw")
-        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/realsense/947122060531/depth/camera_info")
+        self.rgb_topic         = rospy.get_param("~rgb_topic",         "/realsense/032522250211/color/image_raw")
+        self.depth_topic       = rospy.get_param("~depth_topic",       "/realsense/032522250211/aligned_depth_to_color/image_raw")
+        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/realsense/032522250211/aligned_depth_to_color/camera_info")
 
         # Fallback intrinsics (used only if camera_info never arrives)
         self.fx_default = float(rospy.get_param("~fx", 752.0038452148438))
@@ -152,7 +152,7 @@ class SegmentAndGraspNode:
         self.grasp_timeout_sec = float(rospy.get_param("~grasp_timeout_sec", 15.0))
 
         # TF parameters
-        self.camera_frame  = rospy.get_param("~camera_frame",   "cam_947122060531_depth_optical_frame")
+        self.camera_frame  = rospy.get_param("~camera_frame",   "cam_032522250211_depth_optical_frame")
         self.base_frame    = rospy.get_param("~base_frame",     "panda_link0")
         self.tf_timeout_sec= float(rospy.get_param("~tf_timeout_sec", 2.0))
 

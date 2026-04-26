@@ -151,7 +151,7 @@ class QwenVLServiceNode:
             "~model_id",
             "/home/hcrlab/archit/qwen-vl-stretch/models/Qwen2.5-VL-7B-Instruct-AWQ",
         )
-        self.default_image_topic = rospy.get_param("~default_image_topic", "/realsense/947122060531/color/image_raw")
+        self.default_image_topic = rospy.get_param("~default_image_topic", "/realsense/032522250211/color/image_raw")
         self.image_cache_timeout = float(rospy.get_param("~image_cache_timeout", 1.0))
         self.default_max_tokens  = int(rospy.get_param("~default_max_tokens",  512))
         self.default_temperature = float(rospy.get_param("~default_temperature", 0.1))

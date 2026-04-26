@@ -79,9 +79,9 @@ class GetObjectMaskNode:
         )
 
         # Camera topics — same RealSense serial used in detect_objects node
-        self.rgb_topic         = rospy.get_param("~rgb_topic",         "/realsense/947122060531/color/image_raw")
-        self.depth_topic       = rospy.get_param("~depth_topic",       "/realsense/947122060531/depth/image_raw")
-        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/realsense/947122060531/depth/camera_info")
+        self.rgb_topic         = rospy.get_param("~rgb_topic",         "/realsense/032522250211/color/image_raw")
+        self.depth_topic       = rospy.get_param("~depth_topic",       "/realsense/032522250211/aligned_depth_to_color/image_raw")
+        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/realsense/032522250211/aligned_depth_to_color/camera_info")
 
         # Fallback intrinsics (used only if camera_info never arrives)
         self.fx_default = float(rospy.get_param("~fx", 752.0038452148438))
