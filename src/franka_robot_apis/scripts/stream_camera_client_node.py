@@ -240,7 +240,7 @@ def main():
         now = time.time()
         if now - t_last_log >= LOG_INTERVAL:
             fps = frame_count / (now - t_last_log)
-            rospy.loginfo(f"Publishing at ~{fps:.1f} fps")
+            rospy.logdebug(f"Publishing at ~{fps:.1f} fps")
             frame_count = 0
             t_last_log  = now
 
