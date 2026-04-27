@@ -7,6 +7,10 @@
     <arg name="load_gripper" value="$(arg load_gripper)" />
   </include>
 
-  <rosparam command="load" file="$(find serl_franka_controllers)/config/serl_franka_controllers.yaml" />
-  <node name="controller_spawner" pkg="controller_manager" type="spawner" respawn="true" output="screen" args="joint_position_controller"/>
+  <!-- UNCOMMENT THIS TO LOAD SERL's JOINT POSITION CONTROLLER -->
+  <!-- <rosparam command="load" file="$(find serl_franka_controllers)/config/serl_franka_controllers.yaml" /> -->
+  <!-- <node name="controller_spawner" pkg="controller_manager" type="spawner" respawn="true" output="screen" args="joint_position_controller"/> -->
+
+  <!-- SWITCHING TO POSITION JOINT TRAJECTORY CONTROLLER -->
+  <node name="controller_spawner" pkg="controller_manager" type="spawner" respawn="true" output="screen" args="position_joint_trajectory_controller"/>
 </launch>

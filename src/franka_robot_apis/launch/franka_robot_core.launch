@@ -1,13 +1,19 @@
 <launch>
   <!-- Franka Impedance Controller -->
-  <include file="$(find serl_franka_controllers)/launch/impedance.launch">
+  <!-- <include file="$(find serl_franka_controllers)/launch/impedance.launch">
+    <arg name="robot_ip" value="172.16.0.2" />
+    <arg name="load_gripper" value="false" />
+  </include> -->
+
+  <!-- Franka Position Joint Trajectory Controller -->
+  <include file="$(find serl_franka_controllers)/launch/joint.launch">
     <arg name="robot_ip" value="172.16.0.2" />
     <arg name="load_gripper" value="false" />
   </include>
 
   <!-- Static Transform Publisher -->
-  <node pkg="tf2_ros" type="static_transform_publisher" name="camera_to_panda_tf" 
-        args="0 0 0 0 0 0 1 cam_947122060531_depth_optical_frame panda_link0" />
+  <!-- <node pkg="tf2_ros" type="static_transform_publisher" name="camera_to_panda_tf" 
+        args="0 0 0 0 0 0 1 cam_032522250211_depth_optical_frame panda_link0" /> -->
 
   <!-- Robotiq Gripper Node -->
   <node pkg="robotiq_2f_gripper_control" type="Robotiq2FGripperRtuNode.py" name="robotiq_gripper" 
