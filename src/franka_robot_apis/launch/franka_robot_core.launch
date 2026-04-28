@@ -1,15 +1,15 @@
 <launch>
   <!-- Franka Impedance Controller -->
-  <!-- <include file="$(find serl_franka_controllers)/launch/impedance.launch">
-    <arg name="robot_ip" value="172.16.0.2" />
-    <arg name="load_gripper" value="false" />
-  </include> -->
-
-  <!-- Franka Position Joint Trajectory Controller -->
-  <include file="$(find serl_franka_controllers)/launch/joint.launch">
+  <include file="$(find serl_franka_controllers)/launch/impedance.launch">
     <arg name="robot_ip" value="172.16.0.2" />
     <arg name="load_gripper" value="false" />
   </include>
+
+  <!-- Franka Position Joint Trajectory Controller -->
+  <!-- <include file="$(find serl_franka_controllers)/launch/joint.launch">
+    <arg name="robot_ip" value="172.16.0.2" />
+    <arg name="load_gripper" value="false" />
+  </include> -->
 
   <!-- Static Transform Publisher -->
   <!-- <node pkg="tf2_ros" type="static_transform_publisher" name="camera_to_panda_tf" 
@@ -24,7 +24,8 @@
 
   <!-- franka_robot_apis Nodes -->
   <node pkg="franka_robot_apis" type="get_current_robot_state_service.py" name="robot_state_service" output="screen" />
-  <node pkg="franka_robot_apis" type="move_ee_controller_node.py" name="ee_controller" output="screen" />
+  <!-- <node pkg="franka_robot_apis" type="move_ee_controller_node.py" name="ee_controller" output="screen" /> -->
+  <node pkg="franka_robot_apis" type="move_ee_cartesian_controller_node.py" name="ee_cartesian_controller" output="screen" />
   <node pkg="franka_robot_apis" type="move_ee_guarded_node.py" name="ee_guarded_node" output="screen" />
   <node pkg="franka_robot_apis" type="get_vqa_service.py" name="vqa_service" output="screen" />
   <node pkg="franka_robot_apis" type="detect_objects_service.py" name="object_detection_service" output="screen" />
