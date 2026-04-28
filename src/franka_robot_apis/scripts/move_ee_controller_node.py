@@ -3,15 +3,15 @@
 ROS1 Noetic services that move the Franka EE to a target pose by:
   1. Calling /robot/proprioception/get_current_ee_pose to get current EE pose
   2. Sending start + target poses to a motion-generation WebSocket server
-  3. Receiving a trajectory JSON (panda_joint1…7 waypoints at dt=0.02 s)
+  3. Receiving a trajectory JSON (panda_joint1-7 waypoints at dt=0.02 s)
   4. Publishing the full JointTrajectory to
      /position_joint_trajectory_controller/command  (blocking until done)
 
 Services
 --------
-  /robot/control/move_ee_to_pose      (RobotCommand) — absolute target pose
-  /robot/control/move_ee_to_rel_pose  (RobotCommand) — delta position, keep orientation
-  /robot/control/reset_robot          (RobotQuery)   — move to hardcoded home pose
+  /robot/control/move_ee_to_pose      (RobotCommand) - absolute target pose
+  /robot/control/move_ee_to_rel_pose  (RobotCommand) - delta position, keep orientation
+  /robot/control/reset_robot          (RobotQuery)   - move to hardcoded home pose
 
 WebSocket message sent TO server
 ---------------------------------
@@ -31,16 +31,16 @@ WebSocket response FROM server (JSON)
 Trajectory safety & execution notes
 -------------------------------------
   CuRobo / Isaac Sim returns trajectories at dt=0.02 s (50 Hz).  With 62
-  waypoints that is only ~1.24 s of raw motion — far too fast for a physical
-  Franka.  This node applies a configurable TIME_SCALE factor (default 8×)
+  waypoints that is only ~1.24 s of raw motion - far too fast for a physical
+  Franka.  This node applies a configurable TIME_SCALE factor (default 8x)
   which stretches the timing to ~10 s while simultaneously dividing all
   velocities by TIME_SCALE and all accelerations by TIME_SCALE² so that the
   kinematic profile remains consistent.
 
   Before publishing the trajectory the node runs three safety checks:
-    1. Start-state alignment  — waypoint[0] must match live joint state
-    2. Inter-waypoint spike   — no consecutive jump > spike_tol radians
-    3. Scaled velocity clamp  — per-joint speed capped at max_joint_vel rad/s
+    1. Start-state alignment  - waypoint[0] must match live joint state
+    2. Inter-waypoint spike   - no consecutive jump > spike_tol radians
+    3. Scaled velocity clamp  - per-joint speed capped at max_joint_vel rad/s
 
   After publishing the node blocks: it sleeps for the total trajectory
   duration (+ traj_buffer), then polls /joint_states until all 7 arm joints
@@ -48,12 +48,12 @@ Trajectory safety & execution notes
 
 Parameters (all ROS private params, set in launch file or via _param:=value)
 ------------
-  ~time_scale          float  8.0     slow-down multiplier (raw_dt × time_scale)
+  ~time_scale          float  8.0     slow-down multiplier (raw_dt x time_scale)
   ~max_joint_vel       float  0.4     per-joint velocity cap after scaling (rad/s)
   ~start_state_tol     float  0.15    max allowed deviation of traj[0] from live
                                       joints before execution is aborted (rad)
   ~spike_tol           float  0.3     max allowed position jump between consecutive
-                                      waypoints (rad) — catches planner artefacts
+                                      waypoints (rad) - catches planner artefacts
   ~ws_host             str    10.158.54.164
   ~ws_port             int    8765
   ~ws_timeout          float  20.0
@@ -134,14 +134,14 @@ class MoveEEControllerNode:
     Architecture
     ------------
     Service call
-      → get_current_joints (current joint state)
-      → WebSocket send (start joints + target pose)
-      → WebSocket recv (trajectory JSON)
-      → Safety checks (start alignment, spike detection, velocity clamp)
-      → Build time-scaled JointTrajectory
-      → Publish JointTrajectory (all waypoints, timed)
-      → Block until joints converge OR timeout
-      → Return result
+      -> get_current_joints (current joint state)
+      -> WebSocket send (start joints + target pose)
+      -> WebSocket recv (trajectory JSON)
+      -> Safety checks (start alignment, spike detection, velocity clamp)
+      -> Build time-scaled JointTrajectory
+      -> Publish JointTrajectory (all waypoints, timed)
+      -> Block until joints converge OR timeout
+      -> Return result
     """
 
     def __init__(self):
@@ -160,7 +160,7 @@ class MoveEEControllerNode:
         # --- Trajectory timing & safety parameters ---
 
         # Slow-down multiplier applied to the CuRobo trajectory.
-        # CuRobo returns dt=0.02 s (50 Hz).  time_scale=8 → effective
+        # CuRobo returns dt=0.02 s (50 Hz).  time_scale=8 -> effective
         # dt=0.16 s per waypoint (~10 s for 62 waypoints).
         # Increase for even slower / safer motion.
         self.time_scale    = float(rospy.get_param("~time_scale",       1.5))
@@ -202,7 +202,7 @@ class MoveEEControllerNode:
             rospy.wait_for_service(_ee_svc, timeout=self.ee_pose_svc_timeout)
         except rospy.ROSException:
             rospy.logwarn(
-                f"Service {_ee_svc} not yet available — will retry on each call."
+                f"Service {_ee_svc} not yet available - will retry on each call."
             )
         self._ee_pose_proxy = rospy.ServiceProxy(_ee_svc, RobotQuery)
 
@@ -212,7 +212,7 @@ class MoveEEControllerNode:
             rospy.wait_for_service(_joint_svc, timeout=self.current_joints_svc_timeout)
         except rospy.ROSException:
             rospy.logwarn(
-                f"Service {_joint_svc} not yet available — will retry on each call."
+                f"Service {_joint_svc} not yet available - will retry on each call."
             )
         self._current_joints_proxy = rospy.ServiceProxy(_joint_svc, RobotQuery)
 
@@ -235,7 +235,7 @@ class MoveEEControllerNode:
             self.traj_topic, JointTrajectory, queue_size=1, latch=False
         )
 
-        # One request at a time — prevents concurrent trajectory execution
+        # One request at a time - prevents concurrent trajectory execution
         self._traj_lock = threading.Lock()
 
         # ------------------------------------------------------------------ #
@@ -265,13 +265,13 @@ class MoveEEControllerNode:
             f"  ee_pose source   : /robot/proprioception/get_current_ee_pose\n"
             f"  ws               : ws://{self.ws_host}:{self.ws_port}/ws\n"
             f"  traj_topic       : {self.traj_topic}\n"
-            f"  time_scale       : {self.time_scale}×  "
-            f"(raw dt=0.02s → {0.02 * self.time_scale:.3f}s per step)\n"
+            f"  time_scale       : {self.time_scale}x  "
+            f"(raw dt=0.02s -> {0.02 * self.time_scale:.3f}s per step)\n"
             f"  max_joint_vel    : {self.max_joint_vel} rad/s\n"
             f"  start_state_tol  : {self.start_state_tol} rad\n"
             f"  spike_tol        : {self.spike_tol} rad\n"
             f"  joint_tol        : {self.joint_tol} rad\n"
-            f"  websockets       : {'OK' if _WEBSOCKETS_OK else 'MISSING — pip install aiohttp'}"
+            f"  websockets       : {'OK' if _WEBSOCKETS_OK else 'MISSING - pip install aiohttp'}"
         )
 
     # ------------------------------------------------------------------ #
@@ -337,7 +337,7 @@ class MoveEEControllerNode:
         Retrieve current EE pose by calling /robot/proprioception/get_current_ee_pose.
 
         That service reads O_T_EE from /franka_state_controller/franka_states
-        and converts it to position + quaternion — no TF dependency needed here.
+        and converts it to position + quaternion - no TF dependency needed here.
 
         Returns:
             dict {"position": {"x","y","z"}, "orientation": {"x","y","z","w"}}
@@ -467,7 +467,7 @@ class MoveEEControllerNode:
         return data, None
 
     # ------------------------------------------------------------------ #
-    #  Trajectory building — safety checks + time scaling                 #
+    #  Trajectory building - safety checks + time scaling                 #
     # ------------------------------------------------------------------ #
 
     def _build_joint_trajectory(self, traj_data, current_joints):
@@ -475,7 +475,7 @@ class MoveEEControllerNode:
             import numpy as np
             from scipy.interpolate import CubicSpline, make_interp_spline
         except ImportError:
-            return None, "scipy not installed — run: pip install scipy"
+            return None, "scipy not installed - run: pip install scipy"
 
         waypoints = traj_data.get("waypoints", [])
         if not waypoints:
@@ -487,7 +487,7 @@ class MoveEEControllerNode:
         n         = len(waypoints)
 
         # ---------------------------------------------------------------- #
-        #  Safety check 1 — start-state alignment                          #
+        #  Safety check 1 - start-state alignment                          #
         # ---------------------------------------------------------------- #
         traj_start_pos = waypoints[0]["position"]
         robot_arm      = current_joints[:7]
@@ -504,7 +504,7 @@ class MoveEEControllerNode:
         rospy.loginfo(f"[Safety 1/3] Start-state OK (max_dev={max_dev:.5f} rad on {max_dev_joint})")
 
         # ---------------------------------------------------------------- #
-        #  Safety check 2 — inter-waypoint spike detection (on raw data)   #
+        #  Safety check 2 - inter-waypoint spike detection (on raw data)   #
         # ---------------------------------------------------------------- #
         for i in range(1, n):
             prev_pos = waypoints[i - 1]["position"]
@@ -513,7 +513,7 @@ class MoveEEControllerNode:
                 jump = abs(float(curr_pos[j]) - float(prev_pos[j]))
                 if jump > self.spike_tol:
                     return None, (
-                        f"Spike on {jname} wp{i-1}→{i}: "
+                        f"Spike on {jname} wp{i-1}->{i}: "
                         f"Δ={jump:.4f} rad (limit={self.spike_tol:.3f} rad)"
                     )
         rospy.loginfo("[Safety 2/3] Spike detection OK")
@@ -525,8 +525,8 @@ class MoveEEControllerNode:
         #  CuRobo internally plans at ~10x coarser resolution and          #
         #  resamples to dt=0.02 by LINEAR position interpolation.          #
         #  This creates a "staircase": 10 waypoints with identical         #
-        #  positions, then a sudden step — which central-diff converts      #
-        #  into a velocity spike (0→0.014 rad/s in one dt at ts=1).       #
+        #  positions, then a sudden step - which central-diff converts      #
+        #  into a velocity spike (0->0.014 rad/s in one dt at ts=1).       #
         #                                                                   #
         #  Fix: identify the original control points (every RESAMPLE_STEP  #
         #  waypoints) and fit a cubic spline through them, clamped to      #
@@ -536,7 +536,7 @@ class MoveEEControllerNode:
         # ---------------------------------------------------------------- #
 
         # Detect the resampling stride: find first nonzero position step
-        RESAMPLE_STEP = 10   # CuRobo's internal dt / raw_dt — usually 10 for 0.02→0.2s
+        RESAMPLE_STEP = 10   # CuRobo's internal dt / raw_dt - usually 10 for 0.02->0.2s
         # Auto-detect: find first step with meaningful position change
         for stride_check in [5, 10, 20]:
             if n > stride_check:
@@ -558,7 +558,7 @@ class MoveEEControllerNode:
 
         # times_full = np.array([i * scaled_dt for i in range(n)])
         # times_ctrl = times_full[ctrl_indices]
-        # Fit spline on RAW time grid — derivatives are in raw-time units
+        # Fit spline on RAW time grid - derivatives are in raw-time units
         # then scale vels/accs down afterward to match the stretched timeline.
         # If you fit on scaled_dt, the spline derivatives are already "slow"
         # and the controller sees inconsistent pos/vel at time_scale=1.
@@ -573,7 +573,7 @@ class MoveEEControllerNode:
         positions_ctrl[0] = np.array([float(robot_arm[j]) for j in range(nj)])
 
         # # After building ctrl_indices, find where motion actually starts
-        # MIN_MOTION_THRESH = 1e-4  # rad — anything below this is staircase noise
+        # MIN_MOTION_THRESH = 1e-4  # rad - anything below this is staircase noise
 
         # first_motion_idx = ctrl_indices[1]  # default
         # for ci in ctrl_indices[1:]:
@@ -591,7 +591,7 @@ class MoveEEControllerNode:
         # # (ctrl_indices[0] stays as wp0, pinned to robot actual position)
         # if first_motion_idx != ctrl_indices[1]:
         #     ctrl_indices[1] = first_motion_idx
-        #     rospy.loginfo(f"Staircase detected — skipping to wp{first_motion_idx} as second control point")
+        #     rospy.loginfo(f"Staircase detected - skipping to wp{first_motion_idx} as second control point")
 
         # rospy.loginfo(f"RESAMPLE_STEP={RESAMPLE_STEP}, ctrl_indices[:5]={ctrl_indices[:5]}")
 
@@ -615,7 +615,7 @@ class MoveEEControllerNode:
         for j in range(nj):
             bspl = make_interp_spline(
                 times_ctrl, positions_ctrl[:, j],
-                k=5,            # quintic — needs both vel and acc conditions
+                k=5,            # quintic - needs both vel and acc conditions
                 bc_type=bc_zero
             )
             smooth_pos[:, j]  = bspl(times_full, 0)
@@ -629,8 +629,8 @@ class MoveEEControllerNode:
         )
 
         # Scale derivatives to match stretched time_from_start.
-        # Velocity in raw-time units → divide by time_scale.
-        # Acceleration in raw-time units → divide by time_scale².
+        # Velocity in raw-time units -> divide by time_scale.
+        # Acceleration in raw-time units -> divide by time_scale².
         smooth_vels /= self.time_scale
         smooth_accs /= (self.time_scale ** 2)
 
@@ -687,13 +687,13 @@ class MoveEEControllerNode:
         Block the calling thread until the robot arm reaches goal_positions
         or the overall timeout is exceeded.
 
-        Phase 1 — trajectory sleep:
+        Phase 1 - trajectory sleep:
             Sleep for traj_duration + traj_buffer seconds.  During this time
             the position_joint_trajectory_controller is actively tracking the
-            published trajectory.  We do not poll here — polling at high rate
+            published trajectory.  We do not poll here - polling at high rate
             while the controller is mid-execution adds unnecessary load.
 
-        Phase 2 — convergence polling:
+        Phase 2 - convergence polling:
             After the trajectory duration, poll /joint_states at 10 Hz.
             Declare success when every arm joint is within self.joint_tol of
             goal_positions.  Give up after self.converge_timeout seconds.
@@ -707,15 +707,15 @@ class MoveEEControllerNode:
         """
         t_start = time.time()
 
-        # Phase 1 — let the controller run
+        # Phase 1 - let the controller run
         sleep_dur = traj_duration + self.traj_buffer
         rospy.loginfo(
-            f"Trajectory published — sleeping {sleep_dur:.2f}s "
+            f"Trajectory published - sleeping {sleep_dur:.2f}s "
             f"({traj_duration:.2f}s traj + {self.traj_buffer:.2f}s buffer) ..."
         )
         rospy.sleep(sleep_dur)
 
-        # Phase 2 — poll for convergence
+        # Phase 2 - poll for convergence
         rospy.loginfo("Polling joint states for convergence ...")
         poll_rate  = rospy.Rate(10)   # 10 Hz
         poll_start = time.time()
@@ -745,7 +745,7 @@ class MoveEEControllerNode:
             if poll_elapsed >= self.converge_timeout:
                 if current is not None:
                     rospy.logwarn(
-                        f"Convergence timeout after {elapsed:.2f}s — "
+                        f"Convergence timeout after {elapsed:.2f}s - "
                         f"max_err={max_err:.4f} rad on "
                         f"{PANDA_JOINTS[errors.index(max_err)]} "
                         f"(tolerance={self.joint_tol} rad). "
@@ -757,7 +757,7 @@ class MoveEEControllerNode:
                     )
                 else:
                     rospy.logwarn(
-                        f"Convergence timeout after {elapsed:.2f}s — "
+                        f"Convergence timeout after {elapsed:.2f}s - "
                         f"no joint state data available."
                     )
                 return False, elapsed
@@ -774,7 +774,7 @@ class MoveEEControllerNode:
 
     def _execute(self, current_joints, target_pose):
         """
-        Full pipeline: WebSocket → safety-checked trajectory → execute → block.
+        Full pipeline: WebSocket -> safety-checked trajectory -> execute -> block.
 
         Steps
         -----
@@ -803,7 +803,7 @@ class MoveEEControllerNode:
 
         try:
             # ------------------------------------------------------------ #
-            #  Step 1 — Build and send WebSocket message                    #
+            #  Step 1 - Build and send WebSocket message                    #
             # ------------------------------------------------------------ #
             ws_msg = self._build_ws_message(current_joints, target_pose)
             rospy.loginfo(f"Sending to WebSocket: {ws_msg}")
@@ -813,21 +813,21 @@ class MoveEEControllerNode:
                 return self._cmd_fail(response, f"WebSocket error: {ws_err}")
 
             # ------------------------------------------------------------ #
-            #  Step 2 — Parse trajectory JSON                               #
+            #  Step 2 - Parse trajectory JSON                               #
             # ------------------------------------------------------------ #
             traj_data, parse_err = self._parse_trajectory(ws_raw)
             if parse_err:
                 return self._cmd_fail(response, f"Trajectory parse error: {parse_err}")
 
             # ------------------------------------------------------------ #
-            #  Step 3 — Safety checks + build time-scaled JointTrajectory  #
+            #  Step 3 - Safety checks + build time-scaled JointTrajectory  #
             #                                                               #
             #  _build_joint_trajectory() performs:                         #
             #    • Start-state alignment check vs. live robot joints        #
             #    • Inter-waypoint spike detection                           #
             #    • Velocity scaling (÷ time_scale) + clamping              #
             #    • Acceleration scaling (÷ time_scale²)                    #
-            #    • time_from_start stretching (× time_scale)               #
+            #    • time_from_start stretching (x time_scale)               #
             # ------------------------------------------------------------ #
             traj_msg, build_err = self._build_joint_trajectory(
                 traj_data, current_joints
@@ -836,7 +836,7 @@ class MoveEEControllerNode:
                 return self._cmd_fail(response, f"Trajectory safety check failed: {build_err}")
 
             # ------------------------------------------------------------ #
-            #  Step 4 — Publish to position_joint_trajectory_controller     #
+            #  Step 4 - Publish to position_joint_trajectory_controller     #
             # ------------------------------------------------------------ #
             traj_duration = traj_msg.points[-1].time_from_start.to_sec()
             rospy.loginfo(
@@ -850,7 +850,7 @@ class MoveEEControllerNode:
             t_publish = time.time()
 
             # ------------------------------------------------------------ #
-            #  Step 5 — Block until joints converge or timeout             #
+            #  Step 5 - Block until joints converge or timeout             #
             # ------------------------------------------------------------ #
             goal_positions = [float(p) for p in traj_data["waypoints"][-1]["position"]]
 
@@ -869,7 +869,7 @@ class MoveEEControllerNode:
                     "elapsed_time": round(elapsed, 3),
                 })
                 rospy.loginfo(
-                    f"move_ee SUCCESS — elapsed={elapsed:.2f}s, "
+                    f"move_ee SUCCESS - elapsed={elapsed:.2f}s, "
                     f"target={[round(p, 4) for p in goal_positions]}"
                 )
             else:
@@ -880,11 +880,11 @@ class MoveEEControllerNode:
                 )
                 response.data = json.dumps({
                     "success":      False,
-                    "error":        "Timeout — joints did not converge",
+                    "error":        "Timeout - joints did not converge",
                     "elapsed_time": round(elapsed, 3),
                 })
                 rospy.logwarn(
-                    f"move_ee TIMEOUT — elapsed={elapsed:.2f}s"
+                    f"move_ee TIMEOUT - elapsed={elapsed:.2f}s"
                 )
 
             return response
@@ -902,7 +902,7 @@ class MoveEEControllerNode:
 
     def _handle_move_abs(self, request):
         """
-        /robot/control/move_ee_to_pose — absolute target pose.
+        /robot/control/move_ee_to_pose - absolute target pose.
 
         Expected request.req JSON:
         {
@@ -943,7 +943,7 @@ class MoveEEControllerNode:
 
     def _handle_move_rel(self, request):
         """
-        /robot/control/move_ee_to_rel_pose — delta position, orientation unchanged.
+        /robot/control/move_ee_to_rel_pose - delta position, orientation unchanged.
 
         Expected request.req JSON:
         {
@@ -999,7 +999,7 @@ class MoveEEControllerNode:
 
     def _handle_reset(self, request):
         """
-        /robot/control/reset_robot — move to fixed home pose.
+        /robot/control/reset_robot - move to fixed home pose.
         """
         rospy.loginfo("reset_robot request received.")
         query_response = RobotQueryResponse()
@@ -1015,7 +1015,7 @@ class MoveEEControllerNode:
 
         cmd_response = self._execute(current_joints, RESET_POSE)
 
-        # Mirror RobotCommandResponse → RobotQueryResponse
+        # Mirror RobotCommandResponse -> RobotQueryResponse
         query_response.result_code = cmd_response.result_code
         query_response.data        = cmd_response.data
         return query_response
@@ -1111,7 +1111,7 @@ def main():
         node.spin()
 
     except rospy.ROSInterruptException:
-        rospy.loginfo("ROS interrupt — shutting down.")
+        rospy.loginfo("ROS interrupt - shutting down.")
     except Exception as e:
         rospy.logerr(f"Fatal error: {e}\n{traceback.format_exc()}")
     finally:
