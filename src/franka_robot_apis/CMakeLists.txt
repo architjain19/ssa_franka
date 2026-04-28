@@ -178,6 +178,7 @@ catkin_install_python(PROGRAMS
   scripts/get_object_mask_service.py
   scripts/stream_camera_client_node.py
   scripts/set_gripper_width_service.py
+  scripts/move_ee_cartesian_controller_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
