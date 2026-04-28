@@ -199,6 +199,37 @@ class MoveEEControllerNode:
             "orientation": self._normalize_quaternion({"x": qx, "y": qy, "z": qz, "w": qw}),
         }
 
+    def _ensure_quaternion_continuity(self, waypoints_ori_dicts):
+        """
+        Enforce quaternion sign consistency across the trajectory so the
+        controller's SLERP always takes the short arc.
+        Each entry is a dict {x, y, z, w}.
+        """
+        result = []
+        for i, q in enumerate(waypoints_ori_dicts):
+            if i == 0:
+                # Align first waypoint to the robot's current orientation
+                current = self._get_current_pose_dict()
+                if current is not None:
+                    ref = current["orientation"]
+                    dot = (ref["w"]*q["w"] + ref["x"]*q["x"] +
+                        ref["y"]*q["y"] + ref["z"]*q["z"])
+                    if dot < 0:
+                        q = {k: -v for k, v in q.items()}
+            else:
+                # Align to the previous waypoint to avoid mid-trajectory flips
+                prev = result[-1]
+                dot = (prev["w"]*q["w"] + prev["x"]*q["x"] +
+                    prev["y"]*q["y"] + prev["z"]*q["z"])
+                if dot < 0:
+                    q = {k: -v for k, v in q.items()}
+            result.append(q)
+            # rospy.loginfo(
+            #     f"Waypoint {i} orientation: (w={q['w']:.4f}, x={q['x']:.4f}, "
+            #     f"y={q['y']:.4f}, z={q['z']:.4f})"
+            # )
+        return result
+
     def _check_at_target(self, target):
         """Return True when position error is within tolerance."""
         if self.latest_o_tee is None:
@@ -577,10 +608,10 @@ class MoveEEControllerNode:
             dz = current_ee_pose["position"]["z"] - target_pose["position"]["z"]
             dist_to_target = math.sqrt(dx**2 + dy**2 + dz**2)
 
-            if dist_to_target > 2.0:
+            if dist_to_target > 1.0:
                 response.result_code.result_code = ResultCode.INVALID_INPUT
                 response.result_code.message     = (
-                    f"Target too far ({dist_to_target:.2f}m). Max ~2.0m per move."
+                    f"Target too far ({dist_to_target:.2f}m). Max ~1.0m per move."
                 )
                 response.data = json.dumps({"success": False, "error": "Target distance too large"})
                 return response
@@ -641,6 +672,24 @@ class MoveEEControllerNode:
                 f"duration={traj_duration:.2f}s ({self.time_scale}x)"
             )
 
+            ori_dicts = []
+            for idx, waypoint in enumerate(waypoints):
+                ori = waypoint.get("orientation", [
+                    target_pose["orientation"]["w"],
+                    target_pose["orientation"]["x"],
+                    target_pose["orientation"]["y"],
+                    target_pose["orientation"]["z"],
+                ])
+                if isinstance(ori, (list, tuple)) and len(ori) == 4:
+                    # Server returns [w, x, y, z]
+                    ori_dicts.append({"w": float(ori[0]), "x": float(ori[1]),
+                                    "y": float(ori[2]), "z": float(ori[3])})
+                else:
+                    ori_dicts.append(target_pose["orientation"])
+
+            # Fix hemisphere flips
+            ori_dicts = self._ensure_quaternion_continuity(ori_dicts)
+
             t_start_pub = time.time()
 
             for idx, waypoint in enumerate(waypoints):
@@ -651,33 +700,14 @@ class MoveEEControllerNode:
 
                 try:
                     pos = waypoint.get("position", [0, 0, 0])
-                    ori = waypoint.get("orientation", [
-                        target_pose["orientation"]["x"],
-                        target_pose["orientation"]["y"],
-                        target_pose["orientation"]["z"],
-                        target_pose["orientation"]["w"],
-                    ])
-
-                    # orientation from server is [w, x, y, z] as a list
-                    if isinstance(ori, (list, tuple)) and len(ori) == 4:
-                        ori_dict = {
-                            "x": float(ori[1]),
-                            "y": float(ori[2]),
-                            "z": float(ori[3]),
-                            "w": float(ori[0]),
-                        }
-                    else:
-                        ori_dict = target_pose["orientation"]
-
                     pose_dict = {
                         "position": {
                             "x": float(pos[0][0]),
                             "y": float(pos[0][1]),
                             "z": float(pos[0][2]),
                         },
-                        "orientation": ori_dict,
+                        "orientation": ori_dicts[idx],  # already continuity-corrected
                     }
-
                     self.pose_pub.publish(self._create_pose_stamped(pose_dict))
 
                     if idx % 50 == 0:
