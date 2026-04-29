@@ -23,8 +23,12 @@ import tf2_ros
 from agentlace.action import ActionClient, ActionConfig
 
 # ── Camera serials ────────────────────────────────────────────────────────────
-SERIALS = ["123622270802", "032522250211"]
-CALIBRATED_SERIAL = "032522250211"   # eye-in-hand camera with calibrated intrinsics
+USE_D455 = False  # Set to True to use D455 as the calibrated camera (instead of D415)
+CALIBRATED_SERIAL_D455 = "032522250211"   # d455
+CALIBRATED_SERIAL_D415 = "947122060531"   # d415
+
+CALIBRATED_SERIAL = CALIBRATED_SERIAL_D455 if USE_D455 else CALIBRATED_SERIAL_D415
+SERIALS = ["123622270802", CALIBRATED_SERIAL]
 
 observation_keys = []
 for s in SERIALS:
@@ -187,7 +191,7 @@ def main():
     parser.add_argument("--port", type=int, default=6379)
     parser.add_argument("--base-frame", default="panda_link0",
                         help="TF parent frame for extrinsics")
-    parser.add_argument("--camera-frame", default="cam_032522250211_depth_optical_frame",
+    parser.add_argument("--camera-frame", default=f"cam_{CALIBRATED_SERIAL}_depth_optical_frame",
                         help="TF child frame for extrinsics")
     args, _ = parser.parse_known_args()
 

@@ -39,6 +39,8 @@ def parse_args():
                    help="Path to T_base_camera.npz from extrinsics calibration")
     p.add_argument("--serial", default="032522250211",
                    help="Serial of the calibrated camera (default: 032522250211)")
+    p.add_argument("--use_d455", action="store_true",
+                   help="Use D455 camera (default: use D415)")
     p.add_argument("--width", type=int, default=1280,
                    help="Color stream width (default: 1280; MUST match the "
                         "resolution used during intrinsics calibration)")
@@ -153,6 +155,13 @@ def factory_intrinsics_dict(intr, extra=None):
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     args = parse_args()
+
+    if args.use_d455:
+        print("Using D455 as calibrated camera")
+        args.serial = "123622270802"
+    else:
+        print("Using D415 as calibrated camera")
+        args.serial = "947122060531"
 
     # ── Load calibration files ──────────────────────────────────────────────
     calib_color_info = None
