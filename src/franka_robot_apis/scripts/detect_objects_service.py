@@ -172,6 +172,8 @@ class SegmentAndGraspNode:
         #  TF listener  (ros1 tf.TransformListener)                          #
         # ------------------------------------------------------------------ #
         self._tf_listener = tf.TransformListener()
+        # TF broadcaster for shifted grasp pose
+        self._tf_broadcaster = tf.TransformBroadcaster()
 
         # ------------------------------------------------------------------ #
         #  Subscriptions                                                       #
@@ -368,15 +370,70 @@ class SegmentAndGraspNode:
             q_base = None
         else:
             # Post-multiply by 180° around X to fix AnyGrasp EE convention
-            q_180x = {"x": 1.0, "y": 0.0, "z": 0.0, "w": 0.0}
-            q_base = _quaternion_multiply(q_base, q_180x)
+            # q_180x = {"x": 1.0, "y": 0.0, "z": 0.0, "w": 0.0}
+            # q_base = _quaternion_multiply(q_base, q_180x)
+            # Also rotate 180° around Z to adjust end-effector orientation
+            q_180z = {"x": 0.0, "y": 0.0, "z": 1.0, "w": 0.0}
+            q_base = _quaternion_multiply(q_base, q_180z)
+            # Then rotate 90° around -Y to align gripper approach with +Z in base frame
+            q_90yz = {"x": 0.0, "y": -0.7071068, "z": 0.0, "w": 0.7071068}
+            q_base = _quaternion_multiply(q_base, q_90yz)
+            q__180z = {"x": 0.0, "y": 0.0, "z": 1.0, "w": 0.0}
+            q_base = _quaternion_multiply(q_base, q__180z)
 
-            rospy.loginfo(
-                f"Pose in '{self.base_frame}' | "
-                f"xyz=({t_base[0]:.4f}, {t_base[1]:.4f}, {t_base[2]:.4f})  "
-                f"quat=({q_base['x']:.4f}, {q_base['y']:.4f}, "
-                f"{q_base['z']:.4f}, {q_base['w']:.4f})"
-            )
+            # Apply a backward shift of 0.18m along the grasp pose's local X
+            try:
+                shift_m = 0.22
+                # rotation matrix from base-frame quaternion
+                Q = [q_base['x'], q_base['y'], q_base['z'], q_base['w']]
+                R = tft.quaternion_matrix(Q)[0:3, 0:3]
+                # local backward along +Z -> negative Z in local coordinates
+                shift_global = R.dot(np.array([0.0, 0.0, -shift_m]))
+                t_shift = [
+                    float(t_base[0] + shift_global[0]),
+                    float(t_base[1] + shift_global[1]),
+                    float(t_base[2] + shift_global[2]),
+                ]
+
+                # Broadcast the shifted pose as frame 'shifted_grasp' (parent = base_frame)
+                now = rospy.Time.now()
+                self._tf_broadcaster.sendTransform(
+                    (t_shift[0], t_shift[1], t_shift[2]),
+                    (q_base['x'], q_base['y'], q_base['z'], q_base['w']),
+                    now,
+                    "shifted_grasp",
+                    self.base_frame,
+                )
+
+                # small pause to allow TF to propagate, then lookup shifted pose
+                rospy.sleep(0.05)
+                self._tf_listener.waitForTransform(
+                    self.base_frame,
+                    "shifted_grasp",
+                    rospy.Time(0),
+                    rospy.Duration(self.tf_timeout_sec),
+                )
+                trans_s, rot_s = self._tf_listener.lookupTransform(
+                    self.base_frame,
+                    "shifted_grasp",
+                    rospy.Time(0),
+                )
+
+                t_base = [float(trans_s[0]), float(trans_s[1]), float(trans_s[2])]
+                q_base = {"x": float(rot_s[0]), "y": float(rot_s[1]),
+                          "z": float(rot_s[2]), "w": float(rot_s[3])}
+
+                rospy.loginfo(
+                    f"Shifted pose in '{self.base_frame}' | "
+                    f"xyz=({t_base[0]:.4f}, {t_base[1]:.4f}, {t_base[2]:.4f})  "
+                    f"quat=({q_base['x']:.4f}, {q_base['y']:.4f}, "
+                    f"{q_base['z']:.4f}, {q_base['w']:.4f})"
+                )
+
+            except Exception as e:
+                rospy.logwarn(f"Failed to apply/lookup shifted grasp TF: {e}")
+                # keep original t_base/q_base if shifting fails
+
 
         # --- 6. Build and return response --------------------------------
         payload = {
