@@ -104,8 +104,8 @@ class MoveEEControllerNode:
         self._traj_lock = threading.Lock()
 
         self.reset_robot_pose_config = {
-            "position":    {"x": 0.5, "y": 0.0, "z": 0.5},
-            "orientation": {"x": 0.8722, "y": -0.4867, "z": -0.0424, "w": 0.0264},
+            "position":    {"x": 0.356637332280804, "y": -0.020735378720642444, "z": 0.7612196365923467},
+            "orientation": {"x": 0.971639173882294, "y": -0.05496164638642636, "z": 0.2289366734985226, "w": -0.022012104198770453},
         }
 
         # ===== ROS Services =====
