@@ -30,6 +30,13 @@ CALIBRATED_SERIAL_D415 = "947122060531"   # d415
 CALIBRATED_SERIAL = CALIBRATED_SERIAL_D455 if USE_D455 else CALIBRATED_SERIAL_D415
 SERIALS = ["123622270802", CALIBRATED_SERIAL]
 
+# ── Camera role config — must match server ────────────────────────────────
+CAMERA_ROLES = {
+    "123622270802": "wrist",   # D405
+    "947122060531": "scene",   # D415
+    "032522250211": "scene",   # D455
+}
+
 observation_keys = []
 for s in SERIALS:
     observation_keys += [
@@ -38,6 +45,7 @@ for s in SERIALS:
         f"cam_{s}_depth_aligned",
         f"cam_{s}_color_info",
         f"cam_{s}_depth_info",
+        f"cam_{s}_meta",
     ]
     if s == CALIBRATED_SERIAL:
         observation_keys.append(f"cam_{s}_extrinsics")
@@ -144,11 +152,12 @@ def extrinsics_to_tf(ext_dict: dict, parent_frame: str, child_frame: str,
 
     return t
 
-
 def make_publishers(serials):
     pubs = {}
     for s in serials:
-        base = f"/realsense/{s}"
+        role = CAMERA_ROLES.get(s, s)   # "wrist" or "scene"
+        base = f"/realsense/{role}"     # /realsense/wrist or /realsense/scene
+
         pubs[s] = {
             "color_img":  rospy.Publisher(
                 f"{base}/color/image_raw", Image,
@@ -191,7 +200,8 @@ def main():
     parser.add_argument("--port", type=int, default=6379)
     parser.add_argument("--base-frame", default="panda_link0",
                         help="TF parent frame for extrinsics")
-    parser.add_argument("--camera-frame", default=f"cam_{CALIBRATED_SERIAL}_depth_optical_frame",
+    role_var = CAMERA_ROLES.get(CALIBRATED_SERIAL, "scene")
+    parser.add_argument("--camera-frame", default=f"cam_{role_var}_depth_optical_frame",
                         help="TF child frame for extrinsics")
     args, _ = parser.parse_known_args()
 
@@ -319,6 +329,41 @@ def main():
                                 info_cache[serial]["color"], color_fid, stamp))
                 except Exception as e:
                     rospy.logerr(f"[{serial}] depth_aligned publish error: {e}")
+
+            meta = obs.get(f"cam_{serial}_meta")
+            if meta:
+                rospy.set_param(f"/realsense/{meta['role']}/depth_min_mm", meta["depth_min_mm"])
+                rospy.set_param(f"/realsense/{meta['role']}/depth_max_mm", meta["depth_max_mm"])
+                # In the meta block in the client, add:
+                if info_cache[serial]["depth"] and "depth_scale" in info_cache[serial]["depth"]:
+                    rospy.set_param(
+                        f"/realsense/{meta['role']}/depth_scale",
+                        info_cache[serial]["depth"]["depth_scale"]
+                    )
+
+            # only do if camera type is wrist
+            if CAMERA_ROLES.get(serial) == "wrist":
+                # ── Depth range warning — scale raw units → mm using depth_scale ──
+                if depth_aligned is not None and isinstance(depth_aligned, np.ndarray) and meta:
+                    depth_scale = 1.0  # default: assume 1 unit = 1mm
+                    if info_cache[serial]["depth"] and "depth_scale" in info_cache[serial]["depth"]:
+                        # depth_scale is in metres-per-unit, convert to mm-per-unit
+                        depth_scale = info_cache[serial]["depth"]["depth_scale"] * 1000.0
+
+                    valid = depth_aligned[depth_aligned > 0]
+                    if valid.size > 0:
+                        median_mm = float(np.median(valid)) * depth_scale  # ← correct unit
+                        if not (meta["depth_min_mm"] < median_mm < meta["depth_max_mm"]):
+                            rospy.logwarn_throttle(
+                                5.0,
+                                f"[{serial}] Median depth {median_mm:.0f}mm is outside "
+                                f"valid range [{meta['depth_min_mm']}, {meta['depth_max_mm']}]mm "
+                                f"— is the camera aimed correctly?"
+                            )
+                        else:
+                            rospy.logdebug(
+                                f"[{serial}] Median depth {median_mm:.0f}mm ✓"
+                            )
 
 
 if __name__ == "__main__":

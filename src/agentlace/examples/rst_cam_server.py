@@ -151,6 +151,20 @@ def factory_intrinsics_dict(intr, extra=None):
         d.update(extra)
     return d
 
+# ── Camera role config ─────────────────────────────────────────────────────
+# Add this near the top of the file, after parse_args()
+
+CAMERA_ROLES = {
+    "123622270802": "wrist",      # D405 — close range, end-effector
+    "947122060531": "scene",      # D415 — mid range, fixed/calibrated
+    "032522250211": "scene",      # D455 — mid range, fixed/calibrated
+}
+
+# Valid depth range per role (mm) — used as ROS param / metadata
+DEPTH_RANGE_MM = {
+    "wrist": (50,   2000),  # generous — warn only on clearly bogus values
+    "scene": (300,  4000),
+}
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -205,8 +219,13 @@ def main():
         # Only the calibrated camera needs the calibration resolution (1280x720).
         # Other cameras default to 640x480 to stay within USB 3.0 bandwidth
         # when multiple cameras share the same controller.
+        role = CAMERA_ROLES.get(serial, "scene")
         if serial == args.serial:
+            # Calibrated scene camera — use calibration resolution
             c_w, c_h = args.width, args.height
+        elif role == "wrist":
+            # D405 wrist cam — 640x480 is fine, it's close range
+            c_w, c_h = 640, 480
         else:
             c_w, c_h = 640, 480
 
@@ -280,7 +299,22 @@ def main():
             obs[f"cam_{serial}_color_info"] = intrinsics_cache[serial]["color"]
             obs[f"cam_{serial}_depth_info"] = intrinsics_cache[serial]["depth"]
 
-            # Publish extrinsics only for the calibrated camera
+            role = CAMERA_ROLES.get(serial, "scene")
+            depth_min, depth_max = DEPTH_RANGE_MM[role]
+
+            obs[f"cam_{serial}_meta"] = {
+                "role":         role,
+                "depth_min_mm": depth_min,
+                "depth_max_mm": depth_max,
+                "serial":       serial,
+            }
+            obs[f"cam_{serial}_meta"] = {
+                "role":      role,
+                "depth_min_mm": depth_min,
+                "depth_max_mm": depth_max,
+                "serial":    serial,
+            }
+
             if serial == args.serial and calib_extrinsics is not None:
                 obs[f"cam_{serial}_extrinsics"] = calib_extrinsics
         return obs
@@ -295,6 +329,7 @@ def main():
         obs_keys += [
             f"cam_{s}_color", f"cam_{s}_depth", f"cam_{s}_depth_aligned",
             f"cam_{s}_color_info", f"cam_{s}_depth_info",
+            f"cam_{s}_meta",        # metadata
         ]
         if s == args.serial and calib_extrinsics is not None:
             obs_keys.append(f"cam_{s}_extrinsics")

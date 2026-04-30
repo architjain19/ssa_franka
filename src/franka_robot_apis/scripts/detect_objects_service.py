@@ -136,9 +136,9 @@ class SegmentAndGraspNode:
         self.anygrasp_url  = rospy.get_param("~anygrasp_url", "ws://10.158.54.164:8767/get_saved_grasp")
 
         # Camera topics — updated to the robot's actual RealSense topics
-        self.rgb_topic         = rospy.get_param("~rgb_topic",         "/realsense/947122060531/color/image_raw")
-        self.depth_topic       = rospy.get_param("~depth_topic",       "/realsense/947122060531/aligned_depth_to_color/image_raw")
-        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/realsense/947122060531/aligned_depth_to_color/camera_info")
+        self.rgb_topic         = rospy.get_param("~rgb_topic",         "/realsense/wrist/color/image_raw")
+        self.depth_topic       = rospy.get_param("~depth_topic",       "/realsense/wrist/aligned_depth_to_color/image_raw")
+        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/realsense/wrist/aligned_depth_to_color/camera_info")
 
         # Fallback intrinsics (used only if camera_info never arrives)
         self.fx_default = float(rospy.get_param("~fx", 752.0038452148438))
@@ -152,7 +152,7 @@ class SegmentAndGraspNode:
         self.grasp_timeout_sec = float(rospy.get_param("~grasp_timeout_sec", 15.0))
 
         # TF parameters
-        self.camera_frame  = rospy.get_param("~camera_frame",   "cam_947122060531_depth_optical_frame")
+        self.camera_frame  = rospy.get_param("~camera_frame",   "cam_wrist_depth_optical_frame")
         self.base_frame    = rospy.get_param("~base_frame",     "panda_link0")
         self.tf_timeout_sec= float(rospy.get_param("~tf_timeout_sec", 2.0))
 
@@ -383,7 +383,7 @@ class SegmentAndGraspNode:
 
             # Apply a backward shift of 0.18m along the grasp pose's local X
             try:
-                shift_m = 0.22
+                shift_m = 0.15
                 # rotation matrix from base-frame quaternion
                 Q = [q_base['x'], q_base['y'], q_base['z'], q_base['w']]
                 R = tft.quaternion_matrix(Q)[0:3, 0:3]
@@ -567,11 +567,14 @@ class SegmentAndGraspNode:
         Returns (result_dict, error_string). Exactly one is None.
         """
         try:
+            role = "wrist"
+            depth_scale = rospy.get_param(f"/realsense/{role}/depth_scale", 0.001)
             payload = {
                 "text_prompt": text_prompt,
                 "rgb":         self._encode_rgb(rgb),
                 "depth":       self._encode_depth(depth),
                 "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+                "depth_scale": float(depth_scale)
             }
 
             cam_to_base_quat = self._get_cam_to_base_quat()
