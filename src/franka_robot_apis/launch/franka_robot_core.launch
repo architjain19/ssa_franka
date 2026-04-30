@@ -12,8 +12,8 @@
   </include> -->
 
   <!-- Static Transform Publisher -->
-  <!-- <node pkg="tf2_ros" type="static_transform_publisher" name="camera_to_panda_tf" 
-        args="0 0 0 0 0 0 1 cam_032522250211_depth_optical_frame panda_link0" /> -->
+  <node pkg="tf2_ros" type="static_transform_publisher" name="gripper_to_panda_ee_tf" 
+        args="0.095338 0.006353 0.070788 -0.232734 0.226400 0.695586 -0.640888 panda_link8 cam_wrist_depth_optical_frame" />
 
   <!-- Robotiq Gripper Node -->
   <node pkg="robotiq_2f_gripper_control" type="Robotiq2FGripperRtuNode.py" name="robotiq_gripper" 
