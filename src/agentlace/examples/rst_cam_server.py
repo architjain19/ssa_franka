@@ -324,8 +324,7 @@ def main():
                 try:
                     color_to_ir1 = (color_stream
                                     .get_extrinsics_to(ir1_stream))
-                    T_color_ir1[:3, :3] = np.array(
-                        color_to_ir1.rotation).reshape(3, 3)
+                    T_color_ir1[:3, :3] = np.array(color_to_ir1.rotation).reshape(3, 3).T
                     T_color_ir1[:3, 3] = np.array(color_to_ir1.translation)
                 except Exception as e:
                     print(f"  {serial}: failed to query color->IR1 "
