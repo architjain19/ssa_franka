@@ -378,12 +378,12 @@ class SegmentAndGraspNode:
             # Then rotate 90° around -Y to align gripper approach with +Z in base frame
             q_90yz = {"x": 0.0, "y": -0.7071068, "z": 0.0, "w": 0.7071068}
             q_base = _quaternion_multiply(q_base, q_90yz)
-            q__180z = {"x": 0.0, "y": 0.0, "z": 1.0, "w": 0.0}
-            q_base = _quaternion_multiply(q_base, q__180z)
+            # q__180z = {"x": 0.0, "y": 0.0, "z": 1.0, "w": 0.0}
+            # q_base = _quaternion_multiply(q_base, q__180z)
 
             # Apply a backward shift of 0.18m along the grasp pose's local X
             try:
-                shift_m = 0.17
+                shift_m = 0.18
                 # rotation matrix from base-frame quaternion
                 Q = [q_base['x'], q_base['y'], q_base['z'], q_base['w']]
                 R = tft.quaternion_matrix(Q)[0:3, 0:3]
