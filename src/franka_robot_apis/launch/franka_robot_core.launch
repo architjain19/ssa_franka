@@ -17,7 +17,7 @@
 
   <!-- Robotiq Gripper Node -->
   <node pkg="robotiq_2f_gripper_control" type="Robotiq2FGripperRtuNode.py" name="robotiq_gripper" 
-        args="/dev/ttyUSB1" output="screen" />
+        args="/dev/ttyUSB0" output="screen" />
 
   <!-- Stream Camera ROS Client Node -->
   <node pkg="franka_robot_apis" type="stream_camera_client_node.py" name="stream_camera_client" output="screen" />
