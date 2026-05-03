@@ -31,5 +31,6 @@
   <node pkg="franka_robot_apis" type="detect_objects_service.py" name="object_detection_service" output="screen" />
   <node pkg="franka_robot_apis" type="get_object_mask_service.py" name="object_mask_service" output="screen" />
   <node pkg="franka_robot_apis" type="set_gripper_width_service.py" name="gripper_width_service" output="screen" />
+  <node pkg="franka_robot_apis" type="get_placing_pose_service.py" name="placing_pose_service" output="screen" />
 
 </launch>

@@ -1,75 +1,95 @@
 """
 RealSense camera server with calibrated intrinsics and extrinsics.
 
-Streams RGB-D data from all connected RealSense cameras via agentlace.
-For the calibrated camera (--serial), publishes the ChArUco-calibrated
-intrinsics and extrinsics instead of factory defaults.
+Streams RGB-D from D415 (scene) + D405 (wrist) and publishes calibrated
+intrinsics and extrinsics per camera if calibration files are provided.
 
 Usage:
-    python ~/archit/ssa_ws/src/agentlace/examples/rst_cam_server.py --intrinsics ~/archit/ssa_ws/src/agentlace/examples/config/intrinsics.npz --extrinsics ~/archit/ssa_ws/src/agentlace/examples/config/T_base_camera.npz
+    python rst_cam_server.py \
+        --scene-intrinsics  config/scene_intrinsics.npz \
+        --scene-extrinsics  config/T_base_scene.npz \
+        --wrist-intrinsics  config/wrist_intrinsics.npz \
+        --wrist-extrinsics  config/T_base_wrist.npz
 
-Observation keys published per camera:
+You can pass any subset; cameras without calibration fall back to factory
+intrinsics and publish no extrinsics (no TF on the client side).
+
+Observation keys per camera:
     cam_{serial}_color         : (H, W, 3) uint8 BGR
-    cam_{serial}_depth         : (Hd, Wd) uint16 raw depth at native depth resolution
+    cam_{serial}_depth         : (Hd, Wd) uint16 raw depth
     cam_{serial}_depth_aligned : (H, W) uint16 depth aligned to color frame
-                                 (same resolution as color; pixel (u,v) here
-                                 corresponds to pixel (u,v) in color)
-    cam_{serial}_color_info    : dict with fx, fy, cx, cy, dist_coeffs, width, height
-    cam_{serial}_depth_info    : dict with fx, fy, cx, cy, depth_scale, ...
-    cam_{serial}_extrinsics    : dict with T_base_camera (4x4 list), pos, quat_xyzw
-                                 (only for calibrated camera)
+    cam_{serial}_color_info    : dict (fx, fy, cx, cy, dist_coeffs, ...)
+    cam_{serial}_depth_info    : dict (..., depth_scale)
+    cam_{serial}_meta          : dict (role, depth_min_mm, depth_max_mm, serial)
+    cam_{serial}_extrinsics    : dict (T_base_camera, position_xyz, quat_xyzw)
+                                 — only published if extrinsics file given
 """
 
 import argparse
 import time
-import json
 
 import numpy as np
 import pyrealsense2 as rs
 from agentlace.action import ActionServer, ActionConfig
 
+# ── Hard-coded serials ─────────────────────────────────────────────────────
+SCENE_SERIAL = "947122060531"   # D415 — fixed scene camera
+WRIST_SERIAL = "123622270802"   # D405 — end-effector wrist camera
 
-# ── CLI ────────────────────────────────────────────────────────────────────────
+CAMERA_ROLES = {
+    WRIST_SERIAL: "wrist",
+    SCENE_SERIAL: "scene",
+}
+
+# Valid depth range per role (mm)
+DEPTH_RANGE_MM = {
+    "wrist": (50,   2000),
+    "scene": (300,  4000),
+}
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────
 def parse_args():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--intrinsics",
-                   help="Path to intrinsics.npz from ChArUco calibration")
-    p.add_argument("--extrinsics",
-                   help="Path to T_base_camera.npz from extrinsics calibration")
-    p.add_argument("--serial", default="032522250211",
-                   help="Serial of the calibrated camera (default: 032522250211)")
-    p.add_argument("--use_d455", action="store_true",
-                   help="Use D455 camera (default: use D415)")
-    p.add_argument("--width", type=int, default=1280,
-                   help="Color stream width (default: 1280; MUST match the "
-                        "resolution used during intrinsics calibration)")
-    p.add_argument("--height", type=int, default=720,
-                   help="Color stream height (default: 720)")
-    p.add_argument("--depth-width", type=int, default=640)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    # Per-camera calibration files
+    p.add_argument("--scene-intrinsics",
+                   help="intrinsics.npz for scene (D415)")
+    p.add_argument("--scene-extrinsics",
+                   help="T_base_camera.npz for scene (D415)")
+    p.add_argument("--wrist-intrinsics",
+                   help="intrinsics.npz for wrist (D405)")
+    p.add_argument("--wrist-extrinsics",
+                   help="T_base_camera.npz for wrist (D405)")
+
+    # Per-camera resolutions (must match the calibration resolution!)
+    p.add_argument("--scene-width",  type=int, default=1280)
+    p.add_argument("--scene-height", type=int, default=720)
+    p.add_argument("--wrist-width",  type=int, default=640)
+    p.add_argument("--wrist-height", type=int, default=480)
+
+    p.add_argument("--depth-width",  type=int, default=640)
     p.add_argument("--depth-height", type=int, default=480)
-    p.add_argument("--fps", type=int, default=30)
-    p.add_argument("--port", type=int, default=6379,
-                   help="agentlace server port")
+    p.add_argument("--fps",  type=int, default=30)
+    p.add_argument("--port", type=int, default=6379)
     return p.parse_args()
 
 
-# ── Load calibration data ──────────────────────────────────────────────────────
-def load_calibrated_intrinsics(npz_path, expected_w, expected_h):
-    """Load K + distortion from intrinsics.npz.
-
-    Returns a dict matching the color_info schema, or None on failure.
-    """
+# ── Calibration loaders ────────────────────────────────────────────────────
+def load_calibrated_intrinsics(npz_path, expected_w, expected_h, label=""):
+    """Load K + distortion from an intrinsics.npz file."""
     data = np.load(npz_path, allow_pickle=True)
     K = data["K"]
     dist = data["dist"].ravel()
     calib_size = data["image_size"]   # [width, height]
 
     if int(calib_size[0]) != expected_w or int(calib_size[1]) != expected_h:
-        print(f"WARNING: calibration was done at {int(calib_size[0])}x"
-              f"{int(calib_size[1])}, but streaming at {expected_w}x"
-              f"{expected_h}.  Intrinsics will NOT match — either change "
-              f"--width/--height or re-calibrate at this resolution.")
+        print(f"WARNING [{label}]: calibration was done at "
+              f"{int(calib_size[0])}x{int(calib_size[1])}, but streaming at "
+              f"{expected_w}x{expected_h}. Intrinsics will NOT match — "
+              f"either change the streaming resolution or re-calibrate.")
         return None
 
     return {
@@ -86,8 +106,7 @@ def load_calibrated_intrinsics(npz_path, expected_w, expected_h):
 
 
 def _rotation_matrix_to_quat_xyzw(R):
-    """Convert 3x3 rotation matrix to quaternion [x, y, z, w] (numpy only)."""
-    # Shepperd's method - numerically stable, no scipy needed
+    """3x3 rotation matrix → [x, y, z, w] (Shepperd's method)."""
     tr = np.trace(R)
     if tr > 0:
         s = 0.5 / np.sqrt(tr + 1.0)
@@ -117,24 +136,17 @@ def _rotation_matrix_to_quat_xyzw(R):
 
 
 def load_extrinsics(npz_path):
-    """Load T_base_camera from T_base_camera.npz.
-
-    Returns a dict with the 4x4 matrix and convenience fields.
-    """
+    """Load T_base_camera and convert to a serializable dict."""
     data = np.load(npz_path, allow_pickle=True)
     T = data["T_base_camera"]
-    pos = T[:3, 3].tolist()
-    q = _rotation_matrix_to_quat_xyzw(T[:3, :3])
-
     return {
-        "T_base_camera": T.tolist(),       # 4x4 nested list
-        "position_xyz":  pos,              # [x, y, z] meters
-        "quat_xyzw":     q,                # [x, y, z, w]
+        "T_base_camera": T.tolist(),
+        "position_xyz":  T[:3, 3].tolist(),
+        "quat_xyzw":     _rotation_matrix_to_quat_xyzw(T[:3, :3]),
         "method":        str(data.get("method", "unknown")),
     }
 
 
-# ── Build factory intrinsics dict from pyrealsense2 intrinsics ─────────────
 def factory_intrinsics_dict(intr, extra=None):
     d = {
         "width":  intr.width,
@@ -151,84 +163,80 @@ def factory_intrinsics_dict(intr, extra=None):
         d.update(extra)
     return d
 
-# ── Camera role config ─────────────────────────────────────────────────────
-# Add this near the top of the file, after parse_args()
 
-CAMERA_ROLES = {
-    "123622270802": "wrist",      # D405 — close range, end-effector
-    "947122060531": "scene",      # D415 — mid range, fixed/calibrated
-    "032522250211": "scene",      # D455 — mid range, fixed/calibrated
-}
-
-# Valid depth range per role (mm) — used as ROS param / metadata
-DEPTH_RANGE_MM = {
-    "wrist": (50,   2000),  # generous — warn only on clearly bogus values
-    "scene": (300,  4000),
-}
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────
 def main():
     args = parse_args()
 
-    if args.use_d455:
-        print("Using D455 as calibrated camera")
-        args.serial = "123622270802"
-    else:
-        print("Using D415 as calibrated camera")
-        args.serial = "947122060531"
+    # ── Load calibration per role ──────────────────────────────────────────
+    # calib[role] = {"intrinsics": dict|None, "extrinsics": dict|None}
+    calib = {
+        "scene": {"intrinsics": None, "extrinsics": None},
+        "wrist": {"intrinsics": None, "extrinsics": None},
+    }
 
-    # ── Load calibration files ──────────────────────────────────────────────
-    calib_color_info = None
-    if args.intrinsics:
-        print(f"Loading calibrated intrinsics from {args.intrinsics}")
-        calib_color_info = load_calibrated_intrinsics(
-            args.intrinsics, args.width, args.height)
-        if calib_color_info:
-            print(f"  fx={calib_color_info['fx']:.2f}  "
-                  f"fy={calib_color_info['fy']:.2f}  "
-                  f"cx={calib_color_info['cx']:.2f}  "
-                  f"cy={calib_color_info['cy']:.2f}  "
-                  f"dist_coeffs={len(calib_color_info['dist_coeffs'])} params")
+    if args.scene_intrinsics:
+        print(f"Loading SCENE intrinsics from {args.scene_intrinsics}")
+        calib["scene"]["intrinsics"] = load_calibrated_intrinsics(
+            args.scene_intrinsics, args.scene_width, args.scene_height, "scene")
+        if calib["scene"]["intrinsics"]:
+            ci = calib["scene"]["intrinsics"]
+            print(f"  scene  fx={ci['fx']:.2f}  fy={ci['fy']:.2f}  "
+                  f"cx={ci['cx']:.2f}  cy={ci['cy']:.2f}  "
+                  f"dist={len(ci['dist_coeffs'])} params")
 
-    calib_extrinsics = None
-    if args.extrinsics:
-        print(f"Loading extrinsics from {args.extrinsics}")
-        calib_extrinsics = load_extrinsics(args.extrinsics)
-        pos = calib_extrinsics["position_xyz"]
-        print(f"  T_base_camera pos = [{pos[0]:+.4f}, {pos[1]:+.4f}, "
-              f"{pos[2]:+.4f}] m")
+    if args.scene_extrinsics:
+        print(f"Loading SCENE extrinsics from {args.scene_extrinsics}")
+        calib["scene"]["extrinsics"] = load_extrinsics(args.scene_extrinsics)
+        pos = calib["scene"]["extrinsics"]["position_xyz"]
+        print(f"  scene T_base_camera pos = "
+              f"[{pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f}] m")
 
-    # ── Detect all connected RealSense cameras ──────────────────────────────
+    if args.wrist_intrinsics:
+        print(f"Loading WRIST intrinsics from {args.wrist_intrinsics}")
+        calib["wrist"]["intrinsics"] = load_calibrated_intrinsics(
+            args.wrist_intrinsics, args.wrist_width, args.wrist_height, "wrist")
+        if calib["wrist"]["intrinsics"]:
+            ci = calib["wrist"]["intrinsics"]
+            print(f"  wrist  fx={ci['fx']:.2f}  fy={ci['fy']:.2f}  "
+                  f"cx={ci['cx']:.2f}  cy={ci['cy']:.2f}  "
+                  f"dist={len(ci['dist_coeffs'])} params")
+
+    if args.wrist_extrinsics:
+        print(f"Loading WRIST extrinsics from {args.wrist_extrinsics}")
+        calib["wrist"]["extrinsics"] = load_extrinsics(args.wrist_extrinsics)
+        pos = calib["wrist"]["extrinsics"]["position_xyz"]
+        print(f"  wrist T_base_camera pos = "
+              f"[{pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f}] m")
+
+    # ── Detect connected cameras ───────────────────────────────────────────
     ctx = rs.context()
     serials = [d.get_info(rs.camera_info.serial_number) for d in ctx.devices]
     print(f"\nFound {len(serials)} camera(s): {serials}")
 
-    if args.serial and args.serial not in serials:
-        print(f"WARNING: calibrated camera {args.serial} is not connected.")
+    for expected, role in CAMERA_ROLES.items():
+        if expected not in serials:
+            print(f"WARNING: expected {role} camera {expected} not connected.")
 
-    # ── Start a pipeline per camera + cache intrinsics ──────────────────────
+    # ── Start a pipeline per known camera ──────────────────────────────────
     pipelines = {}
-    aligners = {}           # serial -> rs.align  (depth → color frame)
-    intrinsics_cache = {}   # serial -> {"color": dict, "depth": dict}
+    aligners = {}
+    intrinsics_cache = {}
 
     for serial in serials:
+        if serial not in CAMERA_ROLES:
+            print(f"  {serial}: unknown serial — skipping")
+            continue
+
+        role = CAMERA_ROLES[serial]
+        if role == "scene":
+            c_w, c_h = args.scene_width, args.scene_height
+        else:  # wrist
+            c_w, c_h = args.wrist_width, args.wrist_height
+
         pipeline = rs.pipeline()
         cfg = rs.config()
         cfg.enable_device(serial)
-
-        # Only the calibrated camera needs the calibration resolution (1280x720).
-        # Other cameras default to 640x480 to stay within USB 3.0 bandwidth
-        # when multiple cameras share the same controller.
-        role = CAMERA_ROLES.get(serial, "scene")
-        if serial == args.serial:
-            # Calibrated scene camera — use calibration resolution
-            c_w, c_h = args.width, args.height
-        elif role == "wrist":
-            # D405 wrist cam — 640x480 is fine, it's close range
-            c_w, c_h = 640, 480
-        else:
-            c_w, c_h = 640, 480
-
         cfg.enable_stream(rs.stream.color, c_w, c_h,
                           rs.format.bgr8, args.fps)
         cfg.enable_stream(rs.stream.depth, args.depth_width, args.depth_height,
@@ -236,112 +244,94 @@ def main():
         try:
             profile = pipeline.start(cfg)
         except RuntimeError as e:
-            print(f"  {serial}: FAILED to start ({e})")
-            print(f"    Try putting cameras on separate USB controllers, or "
-                  f"reduce --fps.")
+            print(f"  {serial} ({role}): FAILED to start ({e})")
+            print(f"    Try separate USB controllers or reduce --fps.")
             continue
+
         pipelines[serial] = pipeline
-        print(f"  {serial}: streaming color {c_w}x{c_h}, "
+        aligners[serial] = rs.align(rs.stream.color)
+        print(f"  {serial} ({role}): color {c_w}x{c_h}, "
               f"depth {args.depth_width}x{args.depth_height} @ {args.fps}fps")
 
-        # Align depth to color frame so each (u, v) in the aligned depth
-        # corresponds to the same (u, v) in the color image.
-        aligners[serial] = rs.align(rs.stream.color)
-
-        # Color intrinsics — use calibrated if this is the calibrated camera
+        # Color intrinsics — calibrated if available
         color_stream = (profile.get_stream(rs.stream.color)
                         .as_video_stream_profile())
         ci = color_stream.get_intrinsics()
-
-        if serial == args.serial and calib_color_info is not None:
-            color_info = calib_color_info
-            print(f"  {serial}: using CALIBRATED color intrinsics")
+        if calib[role]["intrinsics"] is not None:
+            color_info = calib[role]["intrinsics"]
+            print(f"    using CALIBRATED color intrinsics")
         else:
             color_info = factory_intrinsics_dict(ci)
-            print(f"  {serial}: using factory color intrinsics")
+            print(f"    using factory color intrinsics")
 
-        # Depth intrinsics — always factory (we only calibrated the color cam)
+        # Depth intrinsics — always factory
         depth_stream = (profile.get_stream(rs.stream.depth)
                         .as_video_stream_profile())
         di = depth_stream.get_intrinsics()
         depth_sensor = profile.get_device().first_depth_sensor()
         depth_scale = depth_sensor.get_depth_scale()
-
         depth_info = factory_intrinsics_dict(
             di, extra={"depth_scale": depth_scale})
 
-        intrinsics_cache[serial] = {
-            "color": color_info,
-            "depth": depth_info,
-        }
-        print(f"  {serial}: depth_scale={depth_scale:.6f}")
+        intrinsics_cache[serial] = {"color": color_info, "depth": depth_info}
+        print(f"    depth_scale={depth_scale:.6f}")
 
-    # ── agentlace callbacks ─────────────────────────────────────────────────
+    # ── agentlace callbacks ────────────────────────────────────────────────
     def observation_callback(keys):
         obs = {}
         for serial, pipeline in pipelines.items():
             frames = pipeline.wait_for_frames()
+            aligned = aligners[serial].process(frames)
 
-            # Align depth → color viewport (resamples depth to color resolution
-            # so pixel (u,v) in aligned_depth == pixel (u,v) in color image)
-            aligned_frames = aligners[serial].process(frames)
-
-            color_frame = aligned_frames.get_color_frame()
-            depth_frame = frames.get_depth_frame()           # raw (native res)
-            depth_aligned = aligned_frames.get_depth_frame() # aligned to color
-            if not color_frame or not depth_frame or not depth_aligned:
+            color_frame  = aligned.get_color_frame()
+            depth_frame  = frames.get_depth_frame()
+            depth_a_frame = aligned.get_depth_frame()
+            if not color_frame or not depth_frame or not depth_a_frame:
                 continue
 
             obs[f"cam_{serial}_color"] = np.asanyarray(color_frame.get_data())
             obs[f"cam_{serial}_depth"] = np.asanyarray(depth_frame.get_data())
             obs[f"cam_{serial}_depth_aligned"] = np.asanyarray(
-                depth_aligned.get_data())
+                depth_a_frame.get_data())
             obs[f"cam_{serial}_color_info"] = intrinsics_cache[serial]["color"]
             obs[f"cam_{serial}_depth_info"] = intrinsics_cache[serial]["depth"]
 
-            role = CAMERA_ROLES.get(serial, "scene")
+            role = CAMERA_ROLES[serial]
             depth_min, depth_max = DEPTH_RANGE_MM[role]
-
             obs[f"cam_{serial}_meta"] = {
                 "role":         role,
                 "depth_min_mm": depth_min,
                 "depth_max_mm": depth_max,
                 "serial":       serial,
             }
-            obs[f"cam_{serial}_meta"] = {
-                "role":      role,
-                "depth_min_mm": depth_min,
-                "depth_max_mm": depth_max,
-                "serial":    serial,
-            }
 
-            if serial == args.serial and calib_extrinsics is not None:
-                obs[f"cam_{serial}_extrinsics"] = calib_extrinsics
+            # Per-camera extrinsics (only if loaded for this role)
+            if calib[role]["extrinsics"] is not None:
+                obs[f"cam_{serial}_extrinsics"] = calib[role]["extrinsics"]
         return obs
 
     def action_callback(key, action):
         print(f"Received action '{key}': {action}")
         return {"status": "ok"}
 
-    # ── Build observation + action key lists ────────────────────────────────
+    # ── Build observation keys ─────────────────────────────────────────────
     obs_keys = []
-    for s in pipelines:     # only cameras that started successfully
+    for s in pipelines:
+        role = CAMERA_ROLES[s]
         obs_keys += [
             f"cam_{s}_color", f"cam_{s}_depth", f"cam_{s}_depth_aligned",
-            f"cam_{s}_color_info", f"cam_{s}_depth_info",
-            f"cam_{s}_meta",        # metadata
+            f"cam_{s}_color_info", f"cam_{s}_depth_info", f"cam_{s}_meta",
         ]
-        if s == args.serial and calib_extrinsics is not None:
+        if calib[role]["extrinsics"] is not None:
             obs_keys.append(f"cam_{s}_extrinsics")
-
-    act_keys = ["command"]
 
     print(f"\nObservation keys: {obs_keys}")
     print(f"Server starting on port {args.port} ...")
 
-    config = ActionConfig(port_number=args.port,
-                          action_keys=act_keys,
-                          observation_keys=obs_keys)
+    config = ActionConfig(
+        port_number=args.port,
+        action_keys=["command"],
+        observation_keys=obs_keys)
     server = ActionServer(config, observation_callback, action_callback)
     server.start()
 
