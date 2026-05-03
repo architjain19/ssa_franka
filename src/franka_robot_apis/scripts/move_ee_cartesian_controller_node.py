@@ -161,11 +161,11 @@ class MoveEEControllerNode:
         cy = self.latest_o_tee[13]
         cz = self.latest_o_tee[14]
 
-        # Column-major → row-major rotation sub-matrix
+        # Column-major O_T_EE  ->  row-major rotation submatrix
         r = [
-            self.latest_o_tee[0], self.latest_o_tee[1], self.latest_o_tee[2],
-            self.latest_o_tee[4], self.latest_o_tee[5], self.latest_o_tee[6],
-            self.latest_o_tee[8], self.latest_o_tee[9], self.latest_o_tee[10],
+            self.latest_o_tee[0], self.latest_o_tee[4], self.latest_o_tee[8],   # R[0,0], R[0,1], R[0,2]
+            self.latest_o_tee[1], self.latest_o_tee[5], self.latest_o_tee[9],   # R[1,0], R[1,1], R[1,2]
+            self.latest_o_tee[2], self.latest_o_tee[6], self.latest_o_tee[10],  # R[2,0], R[2,1], R[2,2]
         ]
 
         trace = r[0] + r[4] + r[8]
@@ -261,9 +261,270 @@ class MoveEEControllerNode:
             qx, qy, qz, qw = -qx, -qy, -qz, -qw
         return {"x": qx, "y": qy, "z": qz, "w": qw}
 
+    def _rotate_vector_by_quaternion(self, vec, quat):
+        """
+        Rotate a 3D vector by a unit quaternion (active rotation).
+
+        Given the EE orientation quaternion q (base -> EE), this maps a
+        vector expressed in the EE frame to its components in the base frame:
+            v_base = R(q) * v_ee
+        so e.g. (0, 0, 0.1) in the EE frame becomes a 10 cm step along the
+        gripper's approach axis expressed in base coordinates.
+
+        vec : dict {x,y,z} or sequence of length 3
+        quat: dict {x,y,z,w}
+        Returns: dict {x,y,z}
+        """
+        qn = self._normalize_quaternion(quat)
+        qx, qy, qz, qw = qn["x"], qn["y"], qn["z"], qn["w"]
+
+        if isinstance(vec, dict):
+            vx, vy, vz = float(vec["x"]), float(vec["y"]), float(vec["z"])
+        else:
+            vx, vy, vz = float(vec[0]), float(vec[1]), float(vec[2])
+
+        # Standard quaternion-to-rotation-matrix (q = w + xi + yj + zk)
+        r00 = 1.0 - 2.0 * (qy*qy + qz*qz)
+        r01 = 2.0 * (qx*qy - qw*qz)
+        r02 = 2.0 * (qx*qz + qw*qy)
+        r10 = 2.0 * (qx*qy + qw*qz)
+        r11 = 1.0 - 2.0 * (qx*qx + qz*qz)
+        r12 = 2.0 * (qy*qz - qw*qx)
+        r20 = 2.0 * (qx*qz - qw*qy)
+        r21 = 2.0 * (qy*qz + qw*qx)
+        r22 = 1.0 - 2.0 * (qx*qx + qy*qy)
+
+        return {
+            "x": r00 * vx + r01 * vy + r02 * vz,
+            "y": r10 * vx + r11 * vy + r12 * vz,
+            "z": r20 * vx + r21 * vy + r22 * vz,
+        }
+
     # =========================================================================
     # WebSocket & Trajectory Methods
     # =========================================================================
+
+    def _execute_trajectory_to_pose(self, target_pose):
+        """
+        Core blocking trajectory execution shared by the absolute and
+        relative move services.
+
+        Validates the target, requests a trajectory from the motion server
+        via WebSocket, performs safety checks, publishes waypoints with
+        scaled timing, and polls for EE convergence.
+
+        Acquires _traj_lock so it cannot run concurrently with itself or
+        with `_execute_move_to_pose`.
+
+        Returns a RobotCommandResponse.
+        """
+        response = RobotCommandResponse()
+
+        if not self._traj_lock.acquire(blocking=False):
+            response.result_code.result_code = ResultCode.FAILURE
+            response.result_code.message     = "Another motion is already in progress."
+            response.data = json.dumps({"success": False, "error": "Motion in progress"})
+            return response
+
+        try:
+            t_total_start = time.time()
+
+            # Validate target pose values (cheap sanity check on caller)
+            try:
+                for a in ["x", "y", "z"]:
+                    if not isinstance(target_pose["position"][a], (int, float)):
+                        raise ValueError(f"Invalid position {a}")
+                for a in ["x", "y", "z", "w"]:
+                    if not isinstance(target_pose["orientation"][a], (int, float)):
+                        raise ValueError(f"Invalid orientation {a}")
+            except (ValueError, KeyError) as e:
+                response.result_code.result_code = ResultCode.INVALID_INPUT
+                response.result_code.message     = f"Bad target pose: {e}"
+                response.data = json.dumps({"success": False, "error": str(e)})
+                return response
+
+            if not self.has_received_data:
+                response.result_code.result_code = ResultCode.SERVICE_NOT_RUNNING
+                response.result_code.message     = "Robot not connected (no state data received)"
+                response.data = json.dumps({"success": False, "error": "Robot not connected"})
+                return response
+
+            # ---- Get current state ----
+            current_joints = self._get_current_joints()
+            if current_joints is None:
+                response.result_code.result_code = ResultCode.FAILURE
+                response.result_code.message     = "Failed to get current joint state"
+                response.data = json.dumps({"success": False, "error": "get_current_joints failed"})
+                return response
+
+            current_ee_pose = self._get_current_pose_dict()
+            if current_ee_pose is None:
+                response.result_code.result_code = ResultCode.FAILURE
+                response.result_code.message     = "Failed to get current EE pose"
+                response.data = json.dumps({"success": False, "error": "get_current_ee_pose failed"})
+                return response
+
+            rospy.loginfo(
+                f"Current EE pos: ({current_ee_pose['position']['x']:.3f}, "
+                f"{current_ee_pose['position']['y']:.3f}, "
+                f"{current_ee_pose['position']['z']:.3f})  "
+                f"Target: ({target_pose['position']['x']:.3f}, "
+                f"{target_pose['position']['y']:.3f}, "
+                f"{target_pose['position']['z']:.3f})"
+            )
+
+            # ---- Sanity-check target distance ----
+            dx = current_ee_pose["position"]["x"] - target_pose["position"]["x"]
+            dy = current_ee_pose["position"]["y"] - target_pose["position"]["y"]
+            dz = current_ee_pose["position"]["z"] - target_pose["position"]["z"]
+            dist_to_target = math.sqrt(dx**2 + dy**2 + dz**2)
+
+            if dist_to_target > 1.0:
+                response.result_code.result_code = ResultCode.INVALID_INPUT
+                response.result_code.message     = (
+                    f"Target too far ({dist_to_target:.2f}m). Max ~1.0m per move."
+                )
+                response.data = json.dumps({"success": False, "error": "Target distance too large"})
+                return response
+
+            # ---- WebSocket request ----
+            ws_msg = self._build_ws_message(current_joints, target_pose)
+            rospy.loginfo(f"Sending to WebSocket: {ws_msg[:100]}...")
+            ws_raw, ws_err = self._send_ws(ws_msg)
+            if ws_err:
+                response.result_code.result_code = ResultCode.FAILURE
+                response.result_code.message     = f"WebSocket error: {ws_err}"
+                response.data = json.dumps({"success": False, "error": f"WebSocket: {ws_err}"})
+                return response
+
+            # ---- Parse trajectory ----
+            traj_data, parse_err = self._parse_trajectory(ws_raw)
+            if parse_err:
+                response.result_code.result_code = ResultCode.FAILURE
+                response.result_code.message     = f"Trajectory parse error: {parse_err}"
+                response.data = json.dumps({"success": False, "error": parse_err})
+                return response
+
+            waypoints = traj_data.get("waypoints", [])
+            if not waypoints:
+                response.result_code.result_code = ResultCode.FAILURE
+                response.result_code.message     = "Trajectory contains no waypoints"
+                response.data = json.dumps({"success": False, "error": "Empty trajectory"})
+                return response
+
+            rospy.loginfo(f"Received trajectory with {len(waypoints)} waypoints")
+
+            # ---- Safety checks ----
+            safe, safety_msg = self._check_waypoint_safety(waypoints)
+            if not safe:
+                response.result_code.result_code = ResultCode.FAILURE
+                response.result_code.message     = f"Safety check failed: {safety_msg}"
+                response.data = json.dumps({"success": False, "error": safety_msg})
+                return response
+            rospy.loginfo("Safety check: position jump detection OK")
+
+            # ---- Publish waypoints with scaled timing ----
+            raw_dt        = float(traj_data.get("metadata", {}).get("dt", 0.02))
+            scaled_dt     = raw_dt * self.time_scale
+            traj_duration = (len(waypoints) - 1) * scaled_dt
+
+            rospy.loginfo(
+                f"Trajectory: raw_dt={raw_dt:.3f}s, scaled_dt={scaled_dt:.3f}s, "
+                f"duration={traj_duration:.2f}s ({self.time_scale}x)"
+            )
+
+            ori_dicts = []
+            for waypoint in waypoints:
+                ori = waypoint.get("orientation", [
+                    target_pose["orientation"]["w"],
+                    target_pose["orientation"]["x"],
+                    target_pose["orientation"]["y"],
+                    target_pose["orientation"]["z"],
+                ])
+                if isinstance(ori, (list, tuple)) and len(ori) == 4:
+                    ori_dicts.append({"w": float(ori[0]), "x": float(ori[1]),
+                                    "y": float(ori[2]), "z": float(ori[3])})
+                else:
+                    ori_dicts.append(target_pose["orientation"])
+
+            ori_dicts = self._ensure_quaternion_continuity(ori_dicts)
+
+            t_start_pub = time.time()
+            for idx, waypoint in enumerate(waypoints):
+                desired_time = t_start_pub + idx * scaled_dt
+                sleep_time   = desired_time - time.time()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                try:
+                    pos = waypoint.get("position", [0, 0, 0])
+                    pose_dict = {
+                        "position": {
+                            "x": float(pos[0][0]),
+                            "y": float(pos[0][1]),
+                            "z": float(pos[0][2]),
+                        },
+                        "orientation": ori_dicts[idx],
+                    }
+                    self.pose_pub.publish(self._create_pose_stamped(pose_dict))
+
+                    if idx % 50 == 0:
+                        rospy.logdebug(
+                            f"Waypoint {idx}/{len(waypoints)}: "
+                            f"({pose_dict['position']['x']:.3f}, "
+                            f"{pose_dict['position']['y']:.3f}, "
+                            f"{pose_dict['position']['z']:.3f})"
+                        )
+                except (IndexError, TypeError, KeyError) as e:
+                    rospy.logwarn(f"Error parsing waypoint {idx}: {e}")
+                    continue
+
+            rospy.loginfo(
+                f"Finished publishing {len(waypoints)} waypoints in "
+                f"{time.time() - t_start_pub:.2f}s"
+            )
+
+            # ---- Convergence ----
+            reached, convergence_elapsed = self._wait_for_ee_convergence(target_pose)
+            total_elapsed = time.time() - t_total_start
+
+            if reached:
+                response.result_code.result_code = ResultCode.SUCCESS
+                response.result_code.message     = "Trajectory execution completed successfully"
+                response.data = json.dumps({
+                    "success": True,
+                    "message": "Trajectory execution completed successfully",
+                    "elapsed_time": round(total_elapsed, 3),
+                    "convergence_time": round(convergence_elapsed, 3),
+                })
+                rospy.loginfo(
+                    f"trajectory move SUCCESS — total={total_elapsed:.2f}s "
+                    f"(convergence poll={convergence_elapsed:.2f}s)"
+                )
+            else:
+                response.result_code.result_code = ResultCode.TIMEOUT
+                response.result_code.message     = (
+                    f"EE did not converge within "
+                    f"{self.traj_buffer + self.ee_convergence_timeout:.1f}s"
+                )
+                response.data = json.dumps({
+                    "success": False,
+                    "error": "Convergence timeout",
+                    "elapsed_time": round(total_elapsed, 3),
+                    "convergence_time": round(convergence_elapsed, 3),
+                })
+                rospy.logwarn(f"trajectory move TIMEOUT — total={total_elapsed:.2f}s")
+
+            return response
+
+        except Exception as e:
+            rospy.logerr(f"Unexpected error in _execute_trajectory_to_pose: {traceback.format_exc()}")
+            response.result_code.result_code = ResultCode.FAILURE
+            response.result_code.message     = f"Unexpected error: {e}"
+            response.data = json.dumps({"success": False, "error": str(e)})
+            return response
+
+        finally:
+            self._traj_lock.release()
 
     def _get_current_joints(self):
         """
@@ -530,248 +791,19 @@ class MoveEEControllerNode:
     def _handle_move_ee_to_pose(self, req):
         """
         /robot/control/move_ee_to_pose — absolute pose via WebSocket trajectory.
-
-        Flow:
-          1. Parse & validate target pose
-          2. Get current joint state & EE pose
-          3. Send to motion server via WebSocket
-          4. Parse + safety-check trajectory
-          5. Publish waypoints respecting scaled timing
-          6. Poll for EE convergence (no redundant idle wait)
         """
         response = RobotCommandResponse()
         rospy.loginfo(f"move_ee_to_pose request: {req.req}")
 
-        if not self._traj_lock.acquire(blocking=False):
-            response.result_code.result_code = ResultCode.FAILURE
-            response.result_code.message     = "Another motion is already in progress."
-            response.data = json.dumps({"success": False, "error": "Motion in progress"})
-            return response
-
         try:
-            t_total_start = time.time()  # wall-clock start for the entire service call
-
-            # ----------------------------------------------------------------
-            # Step 1: Parse and validate target pose
-            # ----------------------------------------------------------------
-            try:
-                target_pose = self._parse_target_pose(req.req)
-                for a in ["x", "y", "z"]:
-                    if not isinstance(target_pose["position"][a], (int, float)):
-                        raise ValueError(f"Invalid position {a}")
-                for a in ["x", "y", "z", "w"]:
-                    if not isinstance(target_pose["orientation"][a], (int, float)):
-                        raise ValueError(f"Invalid orientation {a}")
-            except (json.JSONDecodeError, ValueError, KeyError) as e:
-                response.result_code.result_code = ResultCode.INVALID_INPUT
-                response.result_code.message     = f"Bad request: {e}"
-                response.data = json.dumps({"success": False, "error": str(e)})
-                return response
-
-            if not self.has_received_data:
-                response.result_code.result_code = ResultCode.SERVICE_NOT_RUNNING
-                response.result_code.message     = "Robot not connected (no state data received)"
-                response.data = json.dumps({"success": False, "error": "Robot not connected"})
-                return response
-
-            # ----------------------------------------------------------------
-            # Step 2: Get current state
-            # ----------------------------------------------------------------
-            current_joints = self._get_current_joints()
-            if current_joints is None:
-                response.result_code.result_code = ResultCode.FAILURE
-                response.result_code.message     = "Failed to get current joint state"
-                response.data = json.dumps({"success": False, "error": "get_current_joints failed"})
-                return response
-
-            current_ee_pose = self._get_current_pose_dict()
-            if current_ee_pose is None:
-                response.result_code.result_code = ResultCode.FAILURE
-                response.result_code.message     = "Failed to get current EE pose"
-                response.data = json.dumps({"success": False, "error": "get_current_ee_pose failed"})
-                return response
-
-            rospy.loginfo(
-                f"Current EE pos: ({current_ee_pose['position']['x']:.3f}, "
-                f"{current_ee_pose['position']['y']:.3f}, "
-                f"{current_ee_pose['position']['z']:.3f})  "
-                f"Target: ({target_pose['position']['x']:.3f}, "
-                f"{target_pose['position']['y']:.3f}, "
-                f"{target_pose['position']['z']:.3f})"
-            )
-
-            # ----------------------------------------------------------------
-            # Step 3: Sanity-check target distance
-            # ----------------------------------------------------------------
-            dx = current_ee_pose["position"]["x"] - target_pose["position"]["x"]
-            dy = current_ee_pose["position"]["y"] - target_pose["position"]["y"]
-            dz = current_ee_pose["position"]["z"] - target_pose["position"]["z"]
-            dist_to_target = math.sqrt(dx**2 + dy**2 + dz**2)
-
-            if dist_to_target > 1.0:
-                response.result_code.result_code = ResultCode.INVALID_INPUT
-                response.result_code.message     = (
-                    f"Target too far ({dist_to_target:.2f}m). Max ~1.0m per move."
-                )
-                response.data = json.dumps({"success": False, "error": "Target distance too large"})
-                return response
-
-            # ----------------------------------------------------------------
-            # Step 4: WebSocket request
-            # ----------------------------------------------------------------
-            ws_msg = self._build_ws_message(current_joints, target_pose)
-            rospy.loginfo(f"Sending to WebSocket: {ws_msg[:100]}...")
-            ws_raw, ws_err = self._send_ws(ws_msg)
-
-            if ws_err:
-                response.result_code.result_code = ResultCode.FAILURE
-                response.result_code.message     = f"WebSocket error: {ws_err}"
-                response.data = json.dumps({"success": False, "error": f"WebSocket: {ws_err}"})
-                return response
-
-            # ----------------------------------------------------------------
-            # Step 5: Parse trajectory
-            # ----------------------------------------------------------------
-            traj_data, parse_err = self._parse_trajectory(ws_raw)
-            if parse_err:
-                response.result_code.result_code = ResultCode.FAILURE
-                response.result_code.message     = f"Trajectory parse error: {parse_err}"
-                response.data = json.dumps({"success": False, "error": parse_err})
-                return response
-
-            waypoints = traj_data.get("waypoints", [])
-            if not waypoints:
-                response.result_code.result_code = ResultCode.FAILURE
-                response.result_code.message     = "Trajectory contains no waypoints"
-                response.data = json.dumps({"success": False, "error": "Empty trajectory"})
-                return response
-
-            rospy.loginfo(f"Received trajectory with {len(waypoints)} waypoints")
-
-            # ----------------------------------------------------------------
-            # Step 6: Safety checks
-            # ----------------------------------------------------------------
-            safe, safety_msg = self._check_waypoint_safety(waypoints)
-            if not safe:
-                response.result_code.result_code = ResultCode.FAILURE
-                response.result_code.message     = f"Safety check failed: {safety_msg}"
-                response.data = json.dumps({"success": False, "error": safety_msg})
-                return response
-
-            rospy.loginfo("Safety check: position jump detection OK")
-
-            # ----------------------------------------------------------------
-            # Step 7: Publish waypoints with scaled timing
-            # ----------------------------------------------------------------
-            raw_dt     = float(traj_data.get("metadata", {}).get("dt", 0.02))
-            scaled_dt  = raw_dt * self.time_scale
-            traj_duration = (len(waypoints) - 1) * scaled_dt
-
-            rospy.loginfo(
-                f"Trajectory: raw_dt={raw_dt:.3f}s, scaled_dt={scaled_dt:.3f}s, "
-                f"duration={traj_duration:.2f}s ({self.time_scale}x)"
-            )
-
-            ori_dicts = []
-            for idx, waypoint in enumerate(waypoints):
-                ori = waypoint.get("orientation", [
-                    target_pose["orientation"]["w"],
-                    target_pose["orientation"]["x"],
-                    target_pose["orientation"]["y"],
-                    target_pose["orientation"]["z"],
-                ])
-                if isinstance(ori, (list, tuple)) and len(ori) == 4:
-                    # Server returns [w, x, y, z]
-                    ori_dicts.append({"w": float(ori[0]), "x": float(ori[1]),
-                                    "y": float(ori[2]), "z": float(ori[3])})
-                else:
-                    ori_dicts.append(target_pose["orientation"])
-
-            # Fix hemisphere flips
-            ori_dicts = self._ensure_quaternion_continuity(ori_dicts)
-
-            t_start_pub = time.time()
-
-            for idx, waypoint in enumerate(waypoints):
-                desired_time = t_start_pub + idx * scaled_dt
-                sleep_time   = desired_time - time.time()
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-
-                try:
-                    pos = waypoint.get("position", [0, 0, 0])
-                    pose_dict = {
-                        "position": {
-                            "x": float(pos[0][0]),
-                            "y": float(pos[0][1]),
-                            "z": float(pos[0][2]),
-                        },
-                        "orientation": ori_dicts[idx],  # already continuity-corrected
-                    }
-                    self.pose_pub.publish(self._create_pose_stamped(pose_dict))
-
-                    if idx % 50 == 0:
-                        rospy.logdebug(
-                            f"Waypoint {idx}/{len(waypoints)}: "
-                            f"({pose_dict['position']['x']:.3f}, "
-                            f"{pose_dict['position']['y']:.3f}, "
-                            f"{pose_dict['position']['z']:.3f})"
-                        )
-
-                except (IndexError, TypeError, KeyError) as e:
-                    rospy.logwarn(f"Error parsing waypoint {idx}: {e}")
-                    continue
-
-            rospy.loginfo(
-                f"Finished publishing {len(waypoints)} waypoints in "
-                f"{time.time() - t_start_pub:.2f}s"
-            )
-
-            # ----------------------------------------------------------------
-            # Step 8: Poll for convergence — no extra idle sleep here.
-            # Publishing has already consumed traj_duration; we check immediately.
-            # ----------------------------------------------------------------
-            reached, convergence_elapsed = self._wait_for_ee_convergence(target_pose)
-            total_elapsed = time.time() - t_total_start
-
-            if reached:
-                response.result_code.result_code = ResultCode.SUCCESS
-                response.result_code.message     = "Trajectory execution completed successfully"
-                response.data = json.dumps({
-                    "success": True,
-                    "message": "Trajectory execution completed successfully",
-                    "elapsed_time": round(total_elapsed, 3),
-                    "convergence_time": round(convergence_elapsed, 3),
-                })
-                rospy.loginfo(
-                    f"move_ee_to_pose SUCCESS — total={total_elapsed:.2f}s "
-                    f"(convergence poll={convergence_elapsed:.2f}s)"
-                )
-            else:
-                response.result_code.result_code = ResultCode.TIMEOUT
-                response.result_code.message     = (
-                    f"EE did not converge within "
-                    f"{self.traj_buffer + self.ee_convergence_timeout:.1f}s"
-                )
-                response.data = json.dumps({
-                    "success": False,
-                    "error": "Convergence timeout",
-                    "elapsed_time": round(total_elapsed, 3),
-                    "convergence_time": round(convergence_elapsed, 3),
-                })
-                rospy.logwarn(f"move_ee_to_pose TIMEOUT — total={total_elapsed:.2f}s")
-
-            return response
-
-        except Exception as e:
-            rospy.logerr(f"Unexpected error in move_ee_to_pose: {traceback.format_exc()}")
-            response.result_code.result_code = ResultCode.FAILURE
-            response.result_code.message     = f"Unexpected error: {e}"
+            target_pose = self._parse_target_pose(req.req)
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            response.result_code.result_code = ResultCode.INVALID_INPUT
+            response.result_code.message     = f"Bad request: {e}"
             response.data = json.dumps({"success": False, "error": str(e)})
             return response
 
-        finally:
-            self._traj_lock.release()
+        return self._execute_trajectory_to_pose(target_pose)
 
     # -------------------------------------------------------------------------
     # /robot/control/move_ee_to_rel_pose
@@ -795,57 +827,67 @@ class MoveEEControllerNode:
 
     def _handle_move_ee_to_rel_pose(self, req):
         """
-        /robot/control/move_ee_to_rel_pose — applies delta to current position,
-        keeps orientation unchanged, then delegates to _execute_move_to_pose.
+        /robot/control/move_ee_to_rel_pose — applies delta in the END-EFFECTOR
+        frame.
+
+        The requested (x, y, z) delta is rotated by the current EE orientation
+        so that, e.g., +z always moves along the gripper's approach axis,
+        regardless of how the EE is currently posed in the base frame.
+        Orientation is preserved, and the resulting absolute pose is executed
+        through the same WebSocket trajectory pipeline as
+        /robot/control/move_ee_to_pose.
         """
         response = RobotCommandResponse()
+
         try:
-            delta = self._parse_delta_position(req.req)
-
-            if not self.has_received_data:
-                response.result_code.result_code = ResultCode.SERVICE_NOT_RUNNING
-                response.result_code.message     = "Robot not connected"
-                response.data = json.dumps({"success": False, "error": "Robot not connected"})
-                return response
-
-            current_pose = self._get_current_pose_dict()
-            if current_pose is None:
-                response.result_code.result_code = ResultCode.SERVICE_NOT_RUNNING
-                response.result_code.message     = "Current EE pose unavailable"
-                response.data = json.dumps({"success": False, "error": "Current EE pose unavailable"})
-                return response
-
-            target_pose = {
-                "position": {
-                    "x": current_pose["position"]["x"] + float(delta["x"]),
-                    "y": current_pose["position"]["y"] + float(delta["y"]),
-                    "z": current_pose["position"]["z"] + float(delta["z"]),
-                },
-                "orientation": current_pose["orientation"],
-            }
-
-            rospy.loginfo(
-                f"Relative move — delta: ({delta['x']:.3f}, {delta['y']:.3f}, {delta['z']:.3f}) | "
-                f"current: ({current_pose['position']['x']:.3f}, "
-                f"{current_pose['position']['y']:.3f}, "
-                f"{current_pose['position']['z']:.3f}) | "
-                f"target: ({target_pose['position']['x']:.3f}, "
-                f"{target_pose['position']['y']:.3f}, "
-                f"{target_pose['position']['z']:.3f})"
-            )
-
-            return self._execute_move_to_pose(target_pose)
-
-        except ValueError as e:
+            delta_ee = self._parse_delta_position(req.req)
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
             response.result_code.result_code = ResultCode.INVALID_INPUT
-            response.result_code.message     = str(e)
+            response.result_code.message     = f"Bad request: {e}"
             response.data = json.dumps({"success": False, "error": str(e)})
-        except Exception as e:
-            response.result_code.result_code = ResultCode.FAILURE
-            response.result_code.message     = str(e)
-            response.data = json.dumps({"success": False, "error": str(e)})
+            return response
+        delta_ee["y"] = -delta_ee["y"]
+        delta_ee["z"] = -delta_ee["z"]
 
-        return response
+        if not self.has_received_data:
+            response.result_code.result_code = ResultCode.SERVICE_NOT_RUNNING
+            response.result_code.message     = "Robot not connected"
+            response.data = json.dumps({"success": False, "error": "Robot not connected"})
+            return response
+
+        current_pose = self._get_current_pose_dict()
+        if current_pose is None:
+            response.result_code.result_code = ResultCode.SERVICE_NOT_RUNNING
+            response.result_code.message     = "Current EE pose unavailable"
+            response.data = json.dumps({"success": False, "error": "Current EE pose unavailable"})
+            return response
+
+        # EE-frame delta -> base-frame delta using current EE orientation
+        delta_base = self._rotate_vector_by_quaternion(delta_ee, current_pose["orientation"])
+
+        target_pose = {
+            "position": {
+                "x": current_pose["position"]["x"] + delta_base["x"],
+                "y": current_pose["position"]["y"] + delta_base["y"],
+                "z": current_pose["position"]["z"] + delta_base["z"],
+            },
+            # Orientation unchanged
+            "orientation": current_pose["orientation"],
+        }
+
+        rospy.loginfo(
+            f"Relative move (EE frame) — "
+            f"delta_ee:   ({delta_ee['x']:.3f}, {delta_ee['y']:.3f}, {delta_ee['z']:.3f}) | "
+            f"delta_base: ({delta_base['x']:.3f}, {delta_base['y']:.3f}, {delta_base['z']:.3f}) | "
+            f"current:    ({current_pose['position']['x']:.3f}, "
+            f"{current_pose['position']['y']:.3f}, "
+            f"{current_pose['position']['z']:.3f}) | "
+            f"target:     ({target_pose['position']['x']:.3f}, "
+            f"{target_pose['position']['y']:.3f}, "
+            f"{target_pose['position']['z']:.3f})"
+        )
+
+        return self._execute_trajectory_to_pose(target_pose)
 
     # -------------------------------------------------------------------------
     # /robot/control/reset_robot

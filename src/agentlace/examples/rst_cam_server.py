@@ -211,6 +211,14 @@ def main():
 
     # ── Detect connected cameras ───────────────────────────────────────────
     ctx = rs.context()
+
+    # =======================================================================
+    # RESET ALL cameras on startup to clear any stale state
+    # devices = ctx.query_devices()
+    # for dev in devices:
+    #     dev.hardware_reset()
+    # =======================================================================
+    
     serials = [d.get_info(rs.camera_info.serial_number) for d in ctx.devices]
     print(f"\nFound {len(serials)} camera(s): {serials}")
 
