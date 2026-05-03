@@ -63,6 +63,8 @@ from scipy.spatial.transform import Rotation as R
 
 import rospy
 import tf2_ros
+import tf.transformations as tft
+import tf
 
 from robot_api_interfaces.srv import RobotCommand, RobotCommandResponse
 from robot_api_interfaces.msg import ResultCode
@@ -194,12 +196,16 @@ class GetPlacementPoseNode:
         self.mask_call_timeout_sec = float(rospy.get_param("~mask_call_timeout_sec", 30.0))
         self.anyplace_timeout_sec  = float(rospy.get_param("~anyplace_timeout_sec",  90.0))
         self.tf_lookup_timeout_sec = float(rospy.get_param("~tf_lookup_timeout_sec", 3.0))
+        self.tf_timeout_sec= float(rospy.get_param("~tf_timeout_sec", 2.0))
 
         # ------------------------------------------------------------------ #
         #  TF                                                                  #
         # ------------------------------------------------------------------ #
         self.tf_buffer   = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        self._tf_listener = tf.TransformListener()
+        self._tf_broadcaster = tf.TransformBroadcaster()
+
 
         # Serialize service handler invocations — AnyPlace server is single-GPU,
         # and rospy.Service spawns one thread per call. Two simultaneous calls
@@ -355,7 +361,7 @@ class GetPlacementPoseNode:
 
             best_idx = 0   # AnyPlace already ranks (return_top=True in server cfg)
             best_pose_base   = placements_base[best_idx]
-            best_pose_camera = placements_cam[best_idx]
+            # best_pose_camera = placements_cam[best_idx]
 
             rospy.loginfo("[4/4] Composed placement pose in panda_link0:")
             rospy.loginfo(f"  translation: {np.round(best_pose_base[:3, 3], 4).tolist()}")
@@ -364,14 +370,110 @@ class GetPlacementPoseNode:
             
             # --- 8. Build response (compact: best pose only) ------------
             best_quat_xyzw = R.from_matrix(best_pose_base[:3, :3]).as_quat().tolist()
-            best_translation = best_pose_base[:3, 3].tolist()
+            # best_translation = best_pose_base[:3, 3].tolist()
 
             # Score for the best pose. AnyPlace returns ranked poses with
             # return_top=True, so index 0 is the highest-ranked candidate.
             # If the server ever exposes per-pose scores, surface them here.
-            best_score = None
-            if isinstance(ap_result.get("scores"), list) and ap_result["scores"]:
-                best_score = float(ap_result["scores"][best_idx])
+            # best_score = None
+            # if isinstance(ap_result.get("scores"), list) and ap_result["scores"]:
+            #     best_score = float(ap_result["scores"][best_idx])
+
+            # --- 9. Get position and orientation in base frame, and return response -----------
+            def _quaternion_multiply(q_a, q_b):
+                """
+                Hamilton product of two quaternion dicts {x, y, z, w}.
+
+                Args:
+                    q_a (dict): first quaternion
+                    q_b (dict): second quaternion
+
+                Returns:
+                    dict: composed quaternion
+                """
+                ax, ay, az, aw = q_a["x"], q_a["y"], q_a["z"], q_a["w"]
+                bx, by, bz, bw = q_b["x"], q_b["y"], q_b["z"], q_b["w"]
+                return {
+                    "x": float(aw * bx + ax * bw + ay * bz - az * by),
+                    "y": float(aw * by - ax * bz + ay * bw + az * bx),
+                    "z": float(aw * bz + ax * by - ay * bx + az * bw),
+                    "w": float(aw * bw - ax * bx - ay * by - az * bz),
+                }
+            
+            q_base = {
+                "x": best_quat_xyzw[0],
+                "y": best_quat_xyzw[1],
+                "z": best_quat_xyzw[2],
+                "w": best_quat_xyzw[3]
+            }
+            t_base = [float(x) for x in best_pose_base[:3, 3]]
+
+            rospy.loginfo(
+                f"Original pose in '{self.base_frame}' | "
+                f"xyz=({t_base[0]:.4f}, {t_base[1]:.4f}, {t_base[2]:.4f})  "
+                f"quat=({q_base['x']:.4f}, {q_base['y']:.4f}, "
+                f"{q_base['z']:.4f}, {q_base['w']:.4f})"
+            )
+
+            # Post-multiply by 180° around X to fix AnyGrasp EE convention
+            # q_180x = {"x": 1.0, "y": 0.0, "z": 0.0, "w": 0.0}
+            # q_base = _quaternion_multiply(q_base_xyzw, q_180x)
+            q_90yz = {"x": 0.0, "y": 0.7071068, "z": 0.0, "w": 0.7071068}
+            q_base = _quaternion_multiply(q_base, q_90yz)
+
+            # Apply a backward shift of 0.18m along the grasp pose's local X
+            try:
+                shift_m = 0.17
+                # rotation matrix from base-frame quaternion
+                Q = [q_base['x'], q_base['y'], q_base['z'], q_base['w']]
+                BR = tft.quaternion_matrix(Q)[0:3, 0:3]
+                # local backward along +Z -> negative Z in local coordinates
+                shift_global = BR.dot(np.array([0.0, 0.0, -shift_m]))
+                t_shift = [
+                    float(t_base[0] + shift_global[0]),
+                    float(t_base[1] + shift_global[1]),
+                    float(t_base[2] + shift_global[2]),
+                ]
+
+                # Broadcast the shifted pose as frame 'shifted_placement' (parent = base_frame)
+                now = rospy.Time.now()
+                self._tf_broadcaster.sendTransform(
+                    (t_shift[0], t_shift[1], t_shift[2]),
+                    (q_base['x'], q_base['y'], q_base['z'], q_base['w']),
+                    now,
+                    "shifted_placement",
+                    self.base_frame,
+                )
+
+                # small pause to allow TF to propagate, then lookup shifted pose
+                rospy.sleep(0.05)
+                self._tf_listener.waitForTransform(
+                    self.base_frame,
+                    "shifted_placement",
+                    rospy.Time(0),
+                    rospy.Duration(self.tf_timeout_sec),
+                )
+                trans_s, rot_s = self._tf_listener.lookupTransform(
+                    self.base_frame,
+                    "shifted_placement",
+                    rospy.Time(0),
+                )
+
+                t_base = [float(trans_s[0]), float(trans_s[1]), float(trans_s[2])]
+                # q_base = {"x": float(rot_s[0]), "y": float(rot_s[1]),
+                #           "z": float(rot_s[2]), "w": float(rot_s[3])}
+
+                rospy.loginfo(
+                    f"Shifted pose in '{self.base_frame}' | "
+                    f"xyz=({t_base[0]:.4f}, {t_base[1]:.4f}, {t_base[2]:.4f})  "
+                    f"quat=({q_base['x']:.4f}, {q_base['y']:.4f}, "
+                    f"{q_base['z']:.4f}, {q_base['w']:.4f})"
+                )
+
+            except Exception as e:
+                rospy.logwarn(f"Failed to apply/lookup shifted placement TF: {e}")
+                # keep original t_base/q_base if shifting fails
+
 
             payload = {
                 "status":  "success",
@@ -380,32 +482,46 @@ class GetPlacementPoseNode:
                     f"onto '{base_prompt}'."
                 ),
 
+                "placement_pose_base": {
+                    "position": {
+                        "x": t_base[0],
+                        "y": t_base[1],
+                        "z": t_base[2],
+                    },
+                    "orientation": {
+                        "x": q_base["x"],
+                        "y": q_base["y"],
+                        "z": q_base["z"],
+                        "w": q_base["w"],
+                    },
+                },
+
                 # The thing you actually use downstream
-                "best_pose_base":     best_pose_base.tolist(),     # 4x4 in panda_link0
-                "best_pose_position": best_translation,            # [x, y, z]
-                "best_pose_quat_xyzw": best_quat_xyzw,             # [qx, qy, qz, qw]
-                "frame_id":           self.base_frame,             # "panda_link0"
+                # "best_pose_base":     best_pose_base.tolist(),     # 4x4 in panda_link0
+                # "best_pose_position": best_translation,            # [x, y, z]
+                # "best_pose_quat_xyzw": best_quat_xyzw,             # [qx, qy, qz, qw]
+                # "frame_id":           self.base_frame,             # "panda_link0"
 
-                # Metadata / confidence
-                "best_pose_index":     int(best_idx),
-                "best_pose_score":     best_score,
-                "num_pose_candidates": int(poses_cam.shape[0]),
-                "anyplace_latency_sec": round(anyplace_latency, 3),
+                # # Metadata / confidence
+                # "best_pose_index":     int(best_idx),
+                # "best_pose_score":     best_score,
+                # "num_pose_candidates": int(poses_cam.shape[0]),
+                # "anyplace_latency_sec": round(anyplace_latency, 3),
 
-                "base_detection": {
-                    "prompt":      base_prompt,
-                    "labels":      base_meta.get("detected_labels", []),
-                    "confidences": base_meta.get("confidences", []),
-                    "mask_pixels": base_meta.get("mask_pixels"),
-                },
-                "target_detection": {
-                    "prompt":      target_prompt,
-                    "labels":      target_meta.get("detected_labels", []),
-                    "confidences": target_meta.get("confidences", []),
-                    "mask_pixels": target_meta.get("mask_pixels"),
-                },
-                "base_pc_size":   int(base_pc.shape[0]),
-                "target_pc_size": int(target_pc.shape[0]),
+                # "base_detection": {
+                #     "prompt":      base_prompt,
+                #     "labels":      base_meta.get("detected_labels", []),
+                #     "confidences": base_meta.get("confidences", []),
+                #     "mask_pixels": base_meta.get("mask_pixels"),
+                # },
+                # "target_detection": {
+                #     "prompt":      target_prompt,
+                #     "labels":      target_meta.get("detected_labels", []),
+                #     "confidences": target_meta.get("confidences", []),
+                #     "mask_pixels": target_meta.get("mask_pixels"),
+                # },
+                # "base_pc_size":   int(base_pc.shape[0]),
+                # "target_pc_size": int(target_pc.shape[0]),
             }
 
             response.result_code.result_code = ResultCode.SUCCESS
