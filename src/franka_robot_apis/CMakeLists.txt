@@ -180,6 +180,7 @@ catkin_install_python(PROGRAMS
   scripts/set_gripper_width_service.py
   scripts/move_ee_cartesian_controller_node.py
   scripts/get_placing_pose_service.py
+  scripts/detect_marker_service.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
