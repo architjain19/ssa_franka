@@ -88,7 +88,7 @@ def encode_pc_b64(pc):
 
 
 def depth_mask_to_pointcloud(depth, mask, intrinsics, depth_scale,
-                              z_min=0.05, z_max=3.0):
+                              z_min=0.15, z_max=1.5):
     """
     Project masked depth pixels into 3-D points in the camera optical frame.
 
@@ -135,6 +135,61 @@ def downsample_pc(pc, max_points, rng=None):
     idx = rng.choice(pc.shape[0], size=max_points, replace=False)
     return pc[idx]
 
+def transform_pc(pc, T):
+    """Apply 4x4 transform to (N,3) point cloud."""
+    if pc.shape[0] == 0:
+        return pc
+    homo = np.hstack([pc, np.ones((pc.shape[0], 1), dtype=pc.dtype)])
+    return (homo @ T.T)[:, :3].astype(np.float32)
+
+def rank_for_drop_in(placements_base, base_pc):
+    """Heuristic: prefer placements near the support's XY center, just above its top."""
+    base_top_z   = float(np.percentile(base_pc[:, 2], 95))
+    base_xy_mean = base_pc[:, :2].mean(axis=0)
+
+    pos = placements_base[:, :3, 3]
+    xy_err = np.linalg.norm(pos[:, :2] - base_xy_mean, axis=1)   # closer = better
+    z_err  = np.abs(pos[:, 2] - (base_top_z + 0.02))             # 2cm above top
+    score  = -(xy_err + 2.0 * z_err)
+    return int(np.argmax(score))
+
+def crop_to_workspace(pc, x_range=(0.10, 0.90), y_range=(-0.6, 0.6), z_range=(-0.02, 0.6)):
+    """
+    Hard workspace bounds in panda_link0. Anything below z=-2cm is floor/junk;
+    anything above ~60cm is ceiling/arm. Tune x/y to your actual reachable area.
+    """
+    if pc.shape[0] == 0:
+        return pc
+    m = ((pc[:, 0] >= x_range[0]) & (pc[:, 0] <= x_range[1]) &
+         (pc[:, 1] >= y_range[0]) & (pc[:, 1] <= y_range[1]) &
+         (pc[:, 2] >= z_range[0]) & (pc[:, 2] <= z_range[1]))
+    return pc[m]
+
+
+def remove_statistical_outliers(pc, nb_neighbors=20, std_ratio=2.0):
+    """Removes scattered outliers (depth-noise flyers) using open3d's SOR."""
+    if pc.shape[0] < nb_neighbors + 1:
+        return pc
+    import open3d as o3d
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pc.astype(np.float64))
+    pcd_clean, _ = pcd.remove_statistical_outlier(
+        nb_neighbors=nb_neighbors, std_ratio=std_ratio
+    )
+    return np.asarray(pcd_clean.points, dtype=np.float32)
+
+
+def keep_top_slab(pc, slab_thickness=0.04):
+    """
+    For flat-top supports (plate, table, shelf): keep only points within
+    `slab_thickness` of the max z. Forces the model to see the support as a
+    thin surface rather than a deep volume.
+    Skip this for containers (bowl, tube rack, vial holder) — you want depth there.
+    """
+    if pc.shape[0] == 0:
+        return pc
+    z_max = float(pc[:, 2].max())
+    return pc[pc[:, 2] >= (z_max - slab_thickness)]
 
 def transform_stamped_to_matrix(ts):
     """geometry_msgs/TransformStamped -> 4x4 numpy."""
@@ -280,36 +335,70 @@ class GetPlacementPoseNode:
             if err:
                 return self._fail(response, f"Target mask call failed: {err}")
 
-            # --- 4. Build point clouds in camera frame ------------------
+            # --- 4. Build point clouds in CAMERA frame ------------------
             try:
-                base_pc = self._build_pc(base_npz)
-                target_pc = self._build_pc(target_npz)
+                base_pc_cam   = self._build_pc(base_npz)
+                target_pc_cam = self._build_pc(target_npz)
             except Exception as e:
                 return self._fail(response, f"Point-cloud construction failed: {e}")
 
-            rospy.loginfo(f"Built PCs: base={base_pc.shape[0]} pts, target={target_pc.shape[0]} pts")
-            if base_pc.shape[0] < 50 or target_pc.shape[0] < 50:
-                return self._fail(
-                    response,
-                    f"Point clouds too small after depth filtering "
-                    f"(base={base_pc.shape[0]}, target={target_pc.shape[0]}). "
-                    "Check depth quality / mask coverage."
-                )
+            rospy.loginfo(
+                f"Built PCs (camera frame): "
+                f"base={base_pc_cam.shape[0]}, target={target_pc_cam.shape[0]}"
+            )
+            if base_pc_cam.shape[0] < 50 or target_pc_cam.shape[0] < 50:
+                return self._fail(response,
+                    f"PCs too small (base={base_pc_cam.shape[0]}, "
+                    f"target={target_pc_cam.shape[0]}).")
 
-            base_pc   = downsample_pc(base_pc,   max_pc_points)
-            target_pc = downsample_pc(target_pc, max_pc_points)
-
-            # --- 5. Lookup TF panda_link0 <- camera_optical_frame -------
+            # --- 5. Lookup TF and transform PCs into base frame ---------
             try:
                 T_base_cam = self._lookup_T_base_cam()
             except Exception as e:
                 return self._fail(response, f"TF lookup failed: {e}")
             rospy.loginfo(f"T_base_cam translation: {np.round(T_base_cam[:3, 3], 4).tolist()}")
 
-            # --- 6. Call AnyPlace WebSocket -----------------------------
+            base_pc   = transform_pc(base_pc_cam,   T_base_cam)
+            target_pc = transform_pc(target_pc_cam, T_base_cam)
+
+            # ---- NEW: clean PCs in base frame ----
+            n0_base, n0_tgt = base_pc.shape[0], target_pc.shape[0]
+
+            base_pc   = crop_to_workspace(base_pc)
+            target_pc = crop_to_workspace(target_pc)
+
+            base_pc   = remove_statistical_outliers(base_pc)
+            target_pc = remove_statistical_outliers(target_pc)
+
+            # Optional, task-dependent: only for flat supports.
+            # Pass `flat_support=True` in the request to enable.
+            if bool(req.get("flat_support", False)):
+                base_pc = keep_top_slab(base_pc, slab_thickness=0.04)
+
             rospy.loginfo(
-                f"[3/4] Calling AnyPlace | init_k={init_k}, refine_iters={refine_iters}"
+                f"Cleaned PCs: base {n0_base}->{base_pc.shape[0]} "
+                f"(z=[{base_pc[:,2].min():.3f},{base_pc[:,2].max():.3f}]), "
+                f"target {n0_tgt}->{target_pc.shape[0]} "
+                f"(z=[{target_pc[:,2].min():.3f},{target_pc[:,2].max():.3f}])"
             )
+            if base_pc.shape[0] < 50 or target_pc.shape[0] < 50:
+                return self._fail(response,
+                    f"PCs empty after cleaning "
+                    f"(base={base_pc.shape[0]}, target={target_pc.shape[0]}). "
+                    "Workspace bounds may be too tight or the mask is bad.")
+
+            base_pc   = downsample_pc(base_pc,   max_pc_points)
+            target_pc = downsample_pc(target_pc, max_pc_points)
+
+            try:
+                import open3d as o3d
+                o3d.io.write_point_cloud("/tmp/base_pc_raw.ply", o3d.geometry.PointCloud(o3d.utility.Vector3dVector(base_pc.astype(np.float64))))
+                o3d.io.write_point_cloud("/tmp/target_pc_raw.ply", o3d.geometry.PointCloud(o3d.utility.Vector3dVector(target_pc.astype(np.float64))))
+            except Exception as e:
+                rospy.logwarn(f"Could not save debug PCs: {e}")
+
+            # --- 6. Call AnyPlace WebSocket -----------------------------
+            rospy.loginfo(f"[3/4] Calling AnyPlace | init_k={init_k}, refine_iters={refine_iters}")
             t0 = time.time()
             try:
                 ap_result = asyncio.run(
@@ -325,43 +414,24 @@ class GetPlacementPoseNode:
             rospy.loginfo(f"AnyPlace returned in {anyplace_latency:.2f}s")
 
             if ap_result.get("status") != "success":
-                return self._fail(
-                    response,
-                    f"AnyPlace returned non-success: {ap_result.get('message', ap_result)}"
-                )
+                return self._fail(response,
+                    f"AnyPlace returned non-success: {ap_result.get('message', ap_result)}")
 
             try:
-                poses_cam = decode_npz_b64(ap_result["poses_npz"])["poses"]  # (K,4,4)
+                poses_base = decode_npz_b64(ap_result["poses_npz"])["poses"]   # (K,4,4) in base frame
             except Exception as e:
                 return self._fail(response, f"Could not decode AnyPlace poses_npz: {e}")
-            poses_cam = np.asarray(poses_cam, dtype=np.float64)
-            if poses_cam.ndim != 3 or poses_cam.shape[1:] != (4, 4):
-                return self._fail(
-                    response, f"AnyPlace poses have unexpected shape: {poses_cam.shape}"
-                )
+            poses_base = np.asarray(poses_base, dtype=np.float64)
+            if poses_base.ndim != 3 or poses_base.shape[1:] != (4, 4):
+                return self._fail(response, f"AnyPlace poses unexpected shape: {poses_base.shape}")
 
-            # --- 7. Compose transforms ----------------------------------
-            # AnyPlace returns SE(3) transforms that, when applied to the
-            # input target PC (in camera frame), move it to the predicted
-            # placement location (still in camera frame).
-            #
-            # We compute:
-            #     T_cam_target    = current pose of target in camera frame
-            #                       (centroid + identity rot — a stable anchor)
-            #     T_cam_placement = T_relative @ T_cam_target
-            #     T_base_placement = T_base_cam @ T_cam_placement
-            #
-            # If your downstream consumer prefers raw T_relative (e.g. to
-            # left-multiply onto a grasp pose), the raw poses_cam matrices
-            # are also returned in 'all_poses_camera_relative'.
-            T_cam_target = centroid_pose(target_pc)
+            # --- 7. Compose placements directly in base frame -----------
+            T_base_target  = centroid_pose(target_pc)            # in panda_link0 now
+            placements_base = np.einsum("kij,jl->kil", poses_base, T_base_target)
 
-            placements_cam  = np.einsum("kij,jl->kil", poses_cam, T_cam_target)   # (K,4,4)
-            placements_base = np.einsum("ij,kjl->kil", T_base_cam, placements_cam) # (K,4,4)
-
-            best_idx = 0   # AnyPlace already ranks (return_top=True in server cfg)
-            best_pose_base   = placements_base[best_idx]
-            # best_pose_camera = placements_cam[best_idx]
+            best_idx       = 0
+            # best_idx = rank_for_drop_in(placements_base, base_pc)
+            best_pose_base = placements_base[best_idx]
 
             rospy.loginfo("[4/4] Composed placement pose in panda_link0:")
             rospy.loginfo(f"  translation: {np.round(best_pose_base[:3, 3], 4).tolist()}")
@@ -415,15 +485,22 @@ class GetPlacementPoseNode:
                 f"{q_base['z']:.4f}, {q_base['w']:.4f})"
             )
 
+            if t_base[2] < 0.0:
+                t_base[2] = 0.0
+            t_base[2] += 0.15  # lift the pose 2cm above the surface to avoid collisions
+            
+            
             # Post-multiply by 180° around X to fix AnyGrasp EE convention
-            # q_180x = {"x": 1.0, "y": 0.0, "z": 0.0, "w": 0.0}
-            # q_base = _quaternion_multiply(q_base_xyzw, q_180x)
-            q_90yz = {"x": 0.0, "y": 0.7071068, "z": 0.0, "w": 0.7071068}
-            q_base = _quaternion_multiply(q_base, q_90yz)
+            q_180x = {"x": 1.0, "y": 0.0, "z": 0.0, "w": 0.0}
+            q_base = _quaternion_multiply(q_base, q_180x)
+            q_180y = {"x": 0.0, "y": -1.0, "z": 0.0, "w": 0.0}
+            q_base = _quaternion_multiply(q_base, q_180y)
+            # q_90yz = {"x": -0.7071068, "y": 0.0, "z": 0.0, "w": 0.7071068}
+            # q_base = _quaternion_multiply(q_base, q_90yz)
 
             # Apply a backward shift of 0.18m along the grasp pose's local X
             try:
-                shift_m = 0.17
+                shift_m = 0.18
                 # rotation matrix from base-frame quaternion
                 Q = [q_base['x'], q_base['y'], q_base['z'], q_base['w']]
                 BR = tft.quaternion_matrix(Q)[0:3, 0:3]
@@ -460,8 +537,8 @@ class GetPlacementPoseNode:
                 )
 
                 t_base = [float(trans_s[0]), float(trans_s[1]), float(trans_s[2])]
-                # q_base = {"x": float(rot_s[0]), "y": float(rot_s[1]),
-                #           "z": float(rot_s[2]), "w": float(rot_s[3])}
+                q_base = {"x": float(rot_s[0]), "y": float(rot_s[1]),
+                          "z": float(rot_s[2]), "w": float(rot_s[3])}
 
                 rospy.loginfo(
                     f"Shifted pose in '{self.base_frame}' | "

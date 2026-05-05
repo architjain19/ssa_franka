@@ -131,6 +131,7 @@ python -c "import pyrealsense2 as rs; ctx = rs.context(); print(len(ctx.devices)
 pip install openai
 pip install aiohttp
 pip install scipy==1.13.1
+pip install open3d
 ========================================================================================
 
 
