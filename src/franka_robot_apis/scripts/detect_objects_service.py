@@ -383,7 +383,7 @@ class SegmentAndGraspNode:
 
             # Apply a backward shift of 0.17m along the grasp pose's local X
             try:
-                shift_m = 0.17
+                shift_m = 0.18
                 # rotation matrix from base-frame quaternion
                 Q = [q_base['x'], q_base['y'], q_base['z'], q_base['w']]
                 R = tft.quaternion_matrix(Q)[0:3, 0:3]
