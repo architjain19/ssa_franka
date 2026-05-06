@@ -190,11 +190,48 @@ class MarkerDetectionService:
                         z_meas,
                     ], dtype=np.float64)
 
-            # ---- Rotation matrix -> quaternion (x, y, z, w) ----
-            R_mat, _ = cv2.Rodrigues(rvec)
+            # --- Build rotation from corner geometry, not from solvePnP's rvec ---
+
+            # 1. Get the plane normal (Z axis) from PnP — this part is stable
+            R_pnp, _ = cv2.Rodrigues(rvec)
+            z_axis_cam = R_pnp[:, 2]  # marker's Z in camera frame, from PnP
+
+            # 2. Get the marker's "up" direction (X axis) from corner geometry.
+            #    corners[i] is ordered TL, TR, BR, BL by the ArUco detector.
+            #    "Top" of marker = midpoint of TL & TR = (corners[0] + corners[1]) / 2
+            #    "Bottom" of marker = midpoint of BL & BR = (corners[2] + corners[3]) / 2
+            #    We need this in 3D, in the camera frame.
+
+            # Back-project the 4 corners to 3D using the PnP solution.
+            # In the marker's own frame, the corners are self.obj_pts. Transform them
+            # into the camera frame via (R_pnp, tvec).
+            corners_cam = (R_pnp @ self.obj_pts.T).T + tvec.reshape(1, 3)
+            # corners_cam[0]=TL, [1]=TR, [2]=BR, [3]=BL  (matching obj_pts order)
+
+            top_mid_cam    = 0.5 * (corners_cam[0] + corners_cam[1])
+            bottom_mid_cam = 0.5 * (corners_cam[2] + corners_cam[3])
+
+            x_axis_cam = top_mid_cam - bottom_mid_cam
+            x_axis_cam /= np.linalg.norm(x_axis_cam)
+
+            # 3. Re-orthogonalize: project x onto the plane perpendicular to z
+            x_axis_cam = x_axis_cam - np.dot(x_axis_cam, z_axis_cam) * z_axis_cam
+            x_axis_cam /= np.linalg.norm(x_axis_cam)
+
+            # 4. Y = Z × X for a right-handed frame
+            y_axis_cam = np.cross(z_axis_cam, x_axis_cam)
+
+            # 5. Assemble rotation matrix (columns = axes expressed in camera frame)
+            # R_marker_cam = np.column_stack([x_axis_cam, y_axis_cam, z_axis_cam])
+            # Z into the marker, X still along height (toward top), Y by right-hand rule
+            z_axis_cam = -z_axis_cam
+            y_axis_cam = np.cross(z_axis_cam, x_axis_cam)  # recompute Y so frame stays right-handed
+            R_marker_cam = np.column_stack([x_axis_cam, y_axis_cam, z_axis_cam])
+
             T44 = np.eye(4)
-            T44[:3, :3] = R_mat
+            T44[:3, :3] = R_marker_cam
             qx, qy, qz, qw = quaternion_from_matrix(T44)
+
 
             # ---- PoseStamped in camera frame ----
             pose_cam = PoseStamped()
@@ -215,19 +252,19 @@ class MarkerDetectionService:
                 )
                 pose_base_dict = self._pose_to_dict(pose_base.pose)
 
-                # flip the marker pose around local X axis so the Z axis points into the marker face, matching the camera-frame convention.
-                # Extract current orientation
-                w = pose_base_dict["orientation"]["w"]
-                x = pose_base_dict["orientation"]["x"]
-                y = pose_base_dict["orientation"]["y"]
-                z = pose_base_dict["orientation"]["z"]
+                # # flip the marker pose around local X axis so the Z axis points into the marker face, matching the camera-frame convention.
+                # # Extract current orientation
+                # w = pose_base_dict["orientation"]["w"]
+                # x = pose_base_dict["orientation"]["x"]
+                # y = pose_base_dict["orientation"]["y"]
+                # z = pose_base_dict["orientation"]["z"]
 
-                dw, dx, dy, dz = 0.0, 0.7071, 0.7071, 0.0
+                # dw, dx, dy, dz = 0.0, 0.7071, 0.7071, 0.0
 
-                pose_base_dict["orientation"]["w"] = dw*w - dx*x - dy*y - dz*z
-                pose_base_dict["orientation"]["x"] = dw*x + dx*w + dy*z - dz*y
-                pose_base_dict["orientation"]["y"] = dw*y - dx*z + dy*w + dz*x
-                pose_base_dict["orientation"]["z"] = dw*z + dx*y - dy*x + dz*w
+                # pose_base_dict["orientation"]["w"] = dw*w - dx*x - dy*y - dz*z
+                # pose_base_dict["orientation"]["x"] = dw*x + dx*w + dy*z - dz*y
+                # pose_base_dict["orientation"]["y"] = dw*y - dx*z + dy*w + dz*x
+                # pose_base_dict["orientation"]["z"] = dw*z + dx*y - dy*x + dz*w
 
             except (tf2_ros.LookupException,
                     tf2_ros.ConnectivityException,
@@ -251,71 +288,51 @@ class MarkerDetectionService:
                 f"{pose_base_dict['orientation']['z']:.4f}, "
                 f"{pose_base_dict['orientation']['w']:.4f})"
             )
-
-            pose_base_dict['position']['z'] += 0.18  # lift the pose 15cm above the surface to avoid collisions
             
-            # # Apply a backward shift of 0.18m along the grasp pose's local Z
-            # try:
-            #     shift_m = 0.18
-            #     Q = [pose_base_dict["orientation"]["x"], pose_base_dict["orientation"]["y"], pose_base_dict["orientation"]["z"], pose_base_dict["orientation"]["w"]]
-            #     R = quaternion_matrix(Q)[0:3, 0:3]
-            #     # local backward along +Z -> negative Z in local coordinates
-            #     shift_global = R.dot(np.array([0.0, 0.0, -shift_m]))
-            #     t_shift = [
-            #         float(pose_base_dict["position"]["x"] + shift_global[0]),
-            #         float(pose_base_dict["position"]["y"] + shift_global[1]),
-            #         float(pose_base_dict["position"]["z"] + shift_global[2]),
-            #     ]
+            try:
+                shift_m = 0.18
+                Q = [pose_base_dict["orientation"]["x"],
+                    pose_base_dict["orientation"]["y"],
+                    pose_base_dict["orientation"]["z"],
+                    pose_base_dict["orientation"]["w"]]
+                R = quaternion_matrix(Q)[0:3, 0:3]
+                shift_global = R.dot(np.array([0.0, 0.0, -shift_m]))
 
-            #     shifted_tf = TransformStamped()
-            #     shifted_tf.header.stamp = rospy.Time.now()
-            #     shifted_tf.header.frame_id = self.base_frame
-            #     shifted_tf.child_frame_id = "shifted_aruco_marker_{}".format(mid)
-            #     shifted_tf.transform.translation.x = t_shift[0]
-            #     shifted_tf.transform.translation.y = t_shift[1]
-            #     shifted_tf.transform.translation.z = t_shift[2]
-            #     shifted_tf.transform.rotation.x = pose_base_dict["orientation"]["x"]
-            #     shifted_tf.transform.rotation.y = pose_base_dict["orientation"]["y"]
-            #     shifted_tf.transform.rotation.z = pose_base_dict["orientation"]["z"]
-            #     shifted_tf.transform.rotation.w = pose_base_dict["orientation"]["w"]
-            #     self._tf_broadcaster.sendTransform(shifted_tf)
+                t_shift_x = float(pose_base_dict["position"]["x"] + shift_global[0])
+                t_shift_y = float(pose_base_dict["position"]["y"] + shift_global[1])
+                t_shift_z = float(pose_base_dict["position"]["z"] + shift_global[2])
 
-            #     ts = self.tf_buffer.lookup_transform(
-            #         self.base_frame,
-            #         "shifted_aruco_marker_{}".format(mid),
-            #         rospy.Time(0),                       # latest available
-            #         rospy.Duration(self.tf_timeout),
-            #     )
+                # Still publish the TF for RViz visualization
+                # if self.publish_tf:
+                #     shifted_tf = TransformStamped()
+                #     shifted_tf.header.stamp = rospy.Time.now()
+                #     shifted_tf.header.frame_id = self.base_frame
+                #     shifted_tf.child_frame_id = "shifted_aruco_marker_{}".format(mid)
+                #     shifted_tf.transform.translation.x = t_shift_x
+                #     shifted_tf.transform.translation.y = t_shift_y
+                #     shifted_tf.transform.translation.z = t_shift_z
+                #     shifted_tf.transform.rotation.x = pose_base_dict["orientation"]["x"]
+                #     shifted_tf.transform.rotation.y = pose_base_dict["orientation"]["y"]
+                #     shifted_tf.transform.rotation.z = pose_base_dict["orientation"]["z"]
+                #     shifted_tf.transform.rotation.w = pose_base_dict["orientation"]["w"]
+                #     self._tf_broadcaster.sendTransform(shifted_tf)
 
-            #     t_base = [
-            #         float(ts.transform.translation.x),
-            #         float(ts.transform.translation.y),
-            #         float(ts.transform.translation.z),
-            #     ]
-            #     q_base = {
-            #         "x": float(ts.transform.rotation.x),
-            #         "y": float(ts.transform.rotation.y),
-            #         "z": float(ts.transform.rotation.z),
-            #         "w": float(ts.transform.rotation.w),
-            #     }
+                rospy.loginfo(
+                    f"Shifted aruco marker pose in '{self.base_frame}' | "
+                    f"xyz=({t_shift_x:.4f}, {t_shift_y:.4f}, {t_shift_z:.4f})  "
+                    f"quat=({pose_base_dict['orientation']['x']:.4f}, "
+                    f"{pose_base_dict['orientation']['y']:.4f}, "
+                    f"{pose_base_dict['orientation']['z']:.4f}, "
+                    f"{pose_base_dict['orientation']['w']:.4f})"
+                )
 
-            #     rospy.loginfo(
-            #         f"Shifted aruco marker pose in '{self.base_frame}' | "
-            #         f"xyz=({t_base[0]:.4f}, {t_base[1]:.4f}, {t_base[2]:.4f})  "
-            #         f"quat=({q_base['x']:.4f}, {q_base['y']:.4f}, "
-            #         f"{q_base['z']:.4f}, {q_base['w']:.4f})"
-            #     )
+                pose_base_dict["position"]["x"] = t_shift_x
+                pose_base_dict["position"]["y"] = t_shift_y
+                pose_base_dict["position"]["z"] = t_shift_z
+                # orientation unchanged
 
-            #     pose_base_dict["position"]["x"] = t_base[0]
-            #     pose_base_dict["position"]["y"] = t_base[1]
-            #     pose_base_dict["position"]["z"] = t_base[2]
-            #     pose_base_dict["orientation"]["x"] = q_base["x"]
-            #     pose_base_dict["orientation"]["y"] = q_base["y"]
-            #     pose_base_dict["orientation"]["z"] = q_base["z"]
-            #     pose_base_dict["orientation"]["w"] = q_base["w"]
-
-            # except Exception as e:
-            #     rospy.logwarn(f"Failed to apply/lookup shifted aruco marker TF: {e}")
+            except Exception as e:
+                rospy.logwarn(f"Failed to compute shifted aruco marker pose: {e}")
 
             markers_out.append({
                 "id": int(mid),
