@@ -22,7 +22,7 @@ Response JSON format:
 }
 
 ROS1 usage:
-    rosrun franka_robot_apis qwen_vl_service_node_ros1.py
+    rosrun franka_robot_apis get_vqa_service.py
 
     rosservice call /robot/perception/get_vqa_response \
         '{"req": "{\"prompt\": \"Is there an aruco marker?\"}"}'
@@ -131,11 +131,11 @@ def ros_image_to_base64_jpeg(msg, jpeg_quality=90):
 # Main service class
 # ---------------------------------------------------------------------------
 
-class QwenVLServiceNode:
+class VQAServiceNode:
     """
     ROS1 service node wrapping a Qwen2.5-VL vLLM server.
 
-    QwenVLServiceNode architecture:
+    VQAServiceNode architecture:
       - Subscribes to a configurable camera topic (lazy, on demand)
       - Caches the latest frame with a staleness timeout
       - Exposes /robot/perception/get_vqa_response (RobotCommand.srv)
@@ -147,16 +147,40 @@ class QwenVLServiceNode:
         # ------------------------------------------------------------------
         self.qwen_host           = rospy.get_param("~qwen_host",          "10.158.54.164")
         self.qwen_port           = rospy.get_param("~qwen_port",          8000)
-        self.model_id            = rospy.get_param(
-            "~model_id",
-            "/home/hcrlab/archit/qwen-vl-stretch/models/Qwen2.5-VL-7B-Instruct-AWQ",
-        )
         self.default_image_topic = rospy.get_param("~default_image_topic", "/realsense/scene/color/image_raw")
         self.image_cache_timeout = float(rospy.get_param("~image_cache_timeout", 1.0))
         self.default_max_tokens  = int(rospy.get_param("~default_max_tokens",  512))
         self.default_temperature = float(rospy.get_param("~default_temperature", 0.1))
         self.jpeg_quality        = int(rospy.get_param("~jpeg_quality",        90))
         self.request_timeout     = float(rospy.get_param("~request_timeout",   15.0))
+        self.use_qwen_server     = rospy.get_param("~use_qwen_server",    False)
+
+        if self.use_qwen_server:
+            self.model_id = rospy.get_param(
+                "~model_id",
+                "/home/hcrlab/archit/qwen-vl-stretch/models/Qwen2.5-VL-7B-Instruct-AWQ",
+            )
+            rospy.loginfo("Using local VQA for VQA.")
+        else:
+            # read OPENAI_API_KEY from .env
+            try:
+                # switch to package share directory to find .env reliably
+                import rospkg
+                rospack = rospkg.RosPack()
+                pkg_path = rospack.get_path("franka_robot_apis")
+                env_path = f"{pkg_path}/.env"
+                with open(env_path, "r") as f:
+                    for line in f:
+                        if line.startswith("OPENAI_API_KEY="):
+                            self.openai_api_key = line.strip().split("=", 1)[1]
+                            break
+                    else:
+                        raise ValueError("OPENAI_API_KEY not found in .env file")
+            except Exception as e:
+                rospy.logerr(f"Failed to read OPENAI_API_KEY from .env: {e}")
+            
+            self.model_id = rospy.get_param("~model_id", "gpt-4.5-preview")
+            rospy.loginfo("Using OpenAI API for VQA.")
 
         # ------------------------------------------------------------------
         # Internal state
@@ -170,7 +194,7 @@ class QwenVLServiceNode:
         self._subs_lock       = threading.Lock()
 
         # ------------------------------------------------------------------
-        # OpenAI client -> local vLLM (Qwen2.5-VL) server
+        # OpenAI client -> local vLLM (Qwen2.5-VL) server OR OpenAI API
         # ------------------------------------------------------------------
         if not OPENAI_AVAILABLE:
             rospy.logerr(
@@ -179,10 +203,17 @@ class QwenVLServiceNode:
             )
             self._client = None
         else:
-            self._client = OpenAI(
-                api_key="dummy",
-                base_url=f"http://{self.qwen_host}:{self.qwen_port}/v1",
-                timeout=self.request_timeout,
+            if self.use_qwen_server:
+                self._client = OpenAI(
+                    api_key="dummy",
+                    base_url=f"http://{self.qwen_host}:{self.qwen_port}/v1",
+                    timeout=self.request_timeout,
+                )
+            else:
+                self._client = OpenAI(
+                    api_key=self.openai_api_key,
+                    # NO base_url - defaults to api.openai.com
+                    timeout=self.request_timeout,
             )
 
         # ------------------------------------------------------------------
@@ -200,9 +231,9 @@ class QwenVLServiceNode:
         )
 
         rospy.loginfo(
-            "\nQwenVLServiceNode initialized.\n"
+            "\nVQAServiceNode initialized.\n"
             f"  Service:       /robot/perception/get_vqa_response\n"
-            f"  Qwen server:   http://{self.qwen_host}:{self.qwen_port}/v1\n"
+            f"  VQA server:    {'local Qwen2.5-VL at http://{self.qwen_host}:{self.qwen_port}/v1' if self.use_qwen_server else 'OpenAI API'}\n"
             f"  Model:         {self.model_id}\n"
             f"  Default topic: {self.default_image_topic}\n"
             f"  OpenAI client: {'available' if self._client else 'UNAVAILABLE'}\n"
@@ -285,7 +316,7 @@ class QwenVLServiceNode:
         Returns:
             RobotCommand.Response
         """
-        rospy.loginfo(f"Received QwenVL service request: {request.req}")
+        rospy.loginfo(f"Received VQA service request: {request.req}")
 
         response = RobotCommandResponse()
 
@@ -343,7 +374,7 @@ class QwenVLServiceNode:
                 "Ensure 'openai' is installed: pip install openai",
             )
 
-        # --- 6. Call Qwen VL server ---
+        # --- 6. Call VQA server ---
         try:
             answer, _usage = self._query_qwen(
                 prompt=prompt,
@@ -353,10 +384,10 @@ class QwenVLServiceNode:
             )
         except Exception as e:
             rospy.logerr(traceback.format_exc())
-            return self._fail(response, f"Qwen VL inference failed: {e}")
+            return self._fail(response, f"VQA inference failed: {e}")
 
         # --- 7. Build success response ---
-        rospy.loginfo(f"Qwen VL answer: {answer}")
+        rospy.loginfo(f"VQA answer: {answer}")
 
         response.result_code.result_code = ResultCode.SUCCESS
         response.result_code.message     = "Success"
@@ -370,12 +401,12 @@ class QwenVLServiceNode:
         return response
 
     # ------------------------------------------------------------------
-    # Qwen VL inference
+    # VQA inference
     # ------------------------------------------------------------------
 
     def _query_qwen(self, prompt, b64_image, max_tokens, temperature):
         """
-        Send prompt + base64 image to the Qwen VL vLLM server.
+        Send prompt + base64 image to the VQA vLLM server.
 
         Returns:
             tuple[str, dict]: (answer_string, usage_dict)
@@ -384,7 +415,7 @@ class QwenVLServiceNode:
             RuntimeError: on API error or empty choices list
         """
         rospy.loginfo(
-            f"Sending request to Qwen VL server "
+            f"Sending request to VQA server "
             f"(model={self.model_id}, max_tokens={max_tokens}, temperature={temperature})"
         )
 
@@ -412,7 +443,7 @@ class QwenVLServiceNode:
         )
 
         if not completion.choices:
-            raise RuntimeError("Qwen VL server returned an empty choices list.")
+            raise RuntimeError("VQA server returned an empty choices list.")
 
         answer = completion.choices[0].message.content
 
@@ -441,7 +472,7 @@ class QwenVLServiceNode:
         Returns:
             RobotCommandResponse: the populated failure response
         """
-        rospy.logerr(f"QwenVL service error: {error_msg}")
+        rospy.logerr(f"VQA service error: {error_msg}")
         response.result_code.result_code = ResultCode.FAILURE
         response.result_code.message     = error_msg
         response.data = json.dumps({
@@ -460,22 +491,22 @@ class QwenVLServiceNode:
         rospy.spin()
 
 def main():
-    """Initialize and spin the QwenVLServiceNode."""
-    rospy.init_node("qwen_vl_service_node", anonymous=False)
+    """Initialize and spin the VQAServiceNode."""
+    rospy.init_node("get_vqa_service", anonymous=False)
 
     try:
-        rospy.loginfo("Creating QwenVLServiceNode...")
-        node = QwenVLServiceNode()
-        rospy.loginfo("QwenVLServiceNode spinning...")
+        rospy.loginfo("Creating VQAServiceNode...")
+        node = VQAServiceNode()
+        rospy.loginfo("VQAServiceNode spinning...")
         node.spin()
 
     except rospy.ROSInterruptException:
-        rospy.loginfo("ROS interrupt received — shutting down QwenVLServiceNode.")
+        rospy.loginfo("ROS interrupt received — shutting down VQAServiceNode.")
     except Exception as e:
-        rospy.logerr(f"Failed to start QwenVLServiceNode: {e}")
+        rospy.logerr(f"Failed to start VQAServiceNode: {e}")
         rospy.logerr(traceback.format_exc())
     finally:
-        rospy.loginfo("QwenVLServiceNode shutdown complete.")
+        rospy.loginfo("VQAServiceNode shutdown complete.")
 
 
 if __name__ == "__main__":
