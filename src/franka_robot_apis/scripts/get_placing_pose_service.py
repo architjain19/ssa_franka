@@ -487,7 +487,7 @@ class GetPlacementPoseNode:
 
             if t_base[2] < 0.0:
                 t_base[2] = 0.0
-            t_base[2] += 0.15  # lift the pose 2cm above the surface to avoid collisions
+            t_base[2] += 0.15  # lift 15cm above the predicted position to avoid collisions during approach
             
             
             # Post-multiply by 180° around X to fix AnyGrasp EE convention

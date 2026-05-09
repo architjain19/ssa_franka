@@ -43,7 +43,7 @@ from robot_api_interfaces.msg import ResultCode
 # Optional dependency guards
 # --------------------------------------------------------------------------
 try:
-    from openai import OpenAI
+    from openai import OpenAI, AzureOpenAI
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
@@ -153,15 +153,15 @@ class VQAServiceNode:
         self.default_temperature = float(rospy.get_param("~default_temperature", 0.1))
         self.jpeg_quality        = int(rospy.get_param("~jpeg_quality",        90))
         self.request_timeout     = float(rospy.get_param("~request_timeout",   15.0))
-        self.use_qwen_server     = rospy.get_param("~use_qwen_server",    False)
+        self.vqa_server_name     = rospy.get_param("~vqa_server_name", "azure_openai").lower()  # "qwen", "openai", or "azure_openai"
 
-        if self.use_qwen_server:
+        if self.vqa_server_name == "qwen":
             self.model_id = rospy.get_param(
                 "~model_id",
                 "/home/hcrlab/archit/qwen-vl-stretch/models/Qwen2.5-VL-7B-Instruct-AWQ",
             )
             rospy.loginfo("Using local VQA for VQA.")
-        else:
+        elif self.vqa_server_name == "openai":
             # read OPENAI_API_KEY from .env
             try:
                 # switch to package share directory to find .env reliably
@@ -181,6 +181,45 @@ class VQAServiceNode:
             
             self.model_id = rospy.get_param("~model_id", "gpt-4.5-preview")
             rospy.loginfo("Using OpenAI API for VQA.")
+        elif self.vqa_server_name == "azure_openai":
+            # read AZURE_OPENAI_API_KEY from .env
+            try:
+                # switch to package share directory to find .env reliably
+                import rospkg
+                rospack = rospkg.RosPack()
+                pkg_path = rospack.get_path("franka_robot_apis")
+                env_path = f"{pkg_path}/.env"
+                with open(env_path, "r") as f:
+                    for line in f:
+                        if line.startswith("AZURE_OPENAI_API_KEY="):
+                            self.azure_openai_api_key = line.strip().split("=", 1)[1]
+                        elif line.startswith("AZURE_OPENAI_ENDPOINT="):
+                            self.azure_endpoint = line.strip().split("=", 1)[1]
+                        elif line.startswith("AZURE_OPENAI_DEPLOYMENT_NAME="):
+                            self.azure_deployment_name = line.strip().split("=", 1)[1]
+                        elif line.startswith("AZURE_OPENAI_API_VERSION="):
+                            self.api_version = line.strip().split("=", 1)[1]
+                    else:
+                        if not hasattr(self, 'azure_openai_api_key'):
+                            raise ValueError("AZURE_OPENAI_API_KEY not found in .env file")
+                        if not hasattr(self, 'azure_endpoint'):
+                            raise ValueError("AZURE_OPENAI_ENDPOINT not found in .env file")
+                        if not hasattr(self, 'azure_deployment_name'):
+                            raise ValueError("AZURE_OPENAI_DEPLOYMENT_NAME not found in .env file")
+                        if not hasattr(self, 'api_version'):
+                            raise ValueError("AZURE_OPENAI_API_VERSION not found in .env file")
+            except Exception as e:
+                rospy.logerr(f"Failed to read Azure OpenAI config from .env: {e}")
+            
+            self.model_id = self.azure_deployment_name  # For Azure OpenAI, model_id is the deployment name
+            rospy.loginfo("Using Azure OpenAI API for VQA.")
+        else:
+            rospy.logerr(f"Invalid vqa_server_name: '{self.vqa_server_name}'. Must be 'qwen', 'openai', or 'azure_openai'. Defaulting to 'qwen'.")
+            self.vqa_server_name = "qwen"
+            self.model_id = rospy.get_param(
+                "~model_id",
+                "/home/hcrlab/archit/qwen-vl-stretch/models/Qwen2.5-VL-7B-Instruct-AWQ",
+            )
 
         # ------------------------------------------------------------------
         # Internal state
@@ -203,18 +242,27 @@ class VQAServiceNode:
             )
             self._client = None
         else:
-            if self.use_qwen_server:
+            if self.vqa_server_name == "qwen":
                 self._client = OpenAI(
                     api_key="dummy",
                     base_url=f"http://{self.qwen_host}:{self.qwen_port}/v1",
                     timeout=self.request_timeout,
                 )
-            else:
+            elif self.vqa_server_name == "openai":
                 self._client = OpenAI(
                     api_key=self.openai_api_key,
                     # NO base_url - defaults to api.openai.com
                     timeout=self.request_timeout,
             )
+            elif self.vqa_server_name == "azure_openai":
+                self._client = AzureOpenAI(
+                    api_key=self.azure_openai_api_key,
+                    # The endpoint provided in your Azure portal (e.g., https://your-resource.openai.azure.com/)
+                    azure_endpoint=self.azure_endpoint, 
+                    # Must specify an API version (e.g., "2024-08-01-preview" or "2025-01-01-preview")
+                    api_version=self.api_version,
+                    timeout=self.request_timeout,
+                )
 
         # ------------------------------------------------------------------
         # Subscribe to the default camera topic immediately
@@ -233,7 +281,7 @@ class VQAServiceNode:
         rospy.loginfo(
             "\nVQAServiceNode initialized.\n"
             f"  Service:       /robot/perception/get_vqa_response\n"
-            f"  VQA server:    {'local Qwen2.5-VL at http://{self.qwen_host}:{self.qwen_port}/v1' if self.use_qwen_server else 'OpenAI API'}\n"
+            # f"  VQA server:    {'local Qwen2.5-VL at http://{self.qwen_host}:{self.qwen_port}/v1' if self.vqa_server_name == "qwen" else 'OpenAI API'}\n"
             f"  Model:         {self.model_id}\n"
             f"  Default topic: {self.default_image_topic}\n"
             f"  OpenAI client: {'available' if self._client else 'UNAVAILABLE'}\n"
@@ -418,6 +466,8 @@ class VQAServiceNode:
             f"Sending request to VQA server "
             f"(model={self.model_id}, max_tokens={max_tokens}, temperature={temperature})"
         )
+        if self.vqa_server_name == "azure_openai":
+            self.model_id = f"{self.azure_deployment_name}"  # For Azure OpenAI, model_id is the deployment name
 
         completion = self._client.chat.completions.create(
             model=self.model_id,
@@ -438,7 +488,7 @@ class VQAServiceNode:
                     ],
                 }
             ],
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens,
             temperature=temperature,
         )
 
