@@ -74,6 +74,8 @@ def parse_args():
     p.add_argument("--depth-height", type=int, default=480)
     p.add_argument("--fps",  type=int, default=30)
     p.add_argument("--port", type=int, default=6379)
+    p.add_argument("--reset_cam", type=bool, default=False,
+                   help="hardware reset cameras on startup to clear stale state")
     return p.parse_args()
 
 
@@ -214,9 +216,13 @@ def main():
 
     # =======================================================================
     # RESET ALL cameras on startup to clear any stale state
-    # devices = ctx.query_devices()
-    # for dev in devices:
-    #     dev.hardware_reset()
+    if args.reset_cam:
+        print("=======================================================================")
+        print("Resetting cameras to clear stale state...")
+        devices = ctx.query_devices()
+        for dev in devices:
+            dev.hardware_reset()
+        print("=======================================================================")
     # =======================================================================
     
     serials = [d.get_info(rs.camera_info.serial_number) for d in ctx.devices]

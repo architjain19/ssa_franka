@@ -494,7 +494,7 @@ class GetPlacementPoseNode:
 
             if t_base[2] < 0.0:
                 t_base[2] = 0.0
-            t_base[2] += min(0.18, target_obj_height)  # add clearance above target
+            t_base[2] += min(0.08, base_top_height)  # add clearance above target
             rospy.loginfo(f"Adjusted Z for safety: {t_base[2]:.4f}m")
             
             # Post-multiply by 180° around X to fix AnyGrasp EE convention
