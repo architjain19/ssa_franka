@@ -252,6 +252,30 @@ class MoveEEControllerNode:
     # =========================================================================
     # Quaternion helpers
     # =========================================================================
+    def _apply_gripper_shift(self, target_pose, shift_m):
+        """
+        Shift target_pose backward along its OWN local -Z axis by `shift_m`.
+        Orientation is unchanged. Returns a new pose dict.
+
+        Equivalent to the TF-based "shifted_placement" trick: rotate
+        (0, 0, -shift_m) by the target orientation to express the shift in
+        the base frame, then add to the target position.
+        """
+        if shift_m == 0.0:
+            return target_pose
+
+        shift_local = {"x": 0.0, "y": 0.0, "z": -float(shift_m)}
+        shift_base  = self._rotate_vector_by_quaternion(
+            shift_local, target_pose["orientation"]
+        )
+        return {
+            "position": {
+                "x": target_pose["position"]["x"] + shift_base["x"],
+                "y": target_pose["position"]["y"] + shift_base["y"],
+                "z": target_pose["position"]["z"] + shift_base["z"],
+            },
+            "orientation": target_pose["orientation"],
+        }
 
     def _normalize_quaternion(self, q):
         """
@@ -832,34 +856,49 @@ class MoveEEControllerNode:
     # Service Handlers
     # =========================================================================
 
-    def _parse_target_pose(self, req_json):
-        data = json.loads(req_json)
-        if "target_pose" not in data:
-            raise ValueError("Missing 'target_pose'")
-        tp = data["target_pose"]
-        for k in ["x", "y", "z"]:
-            if k not in tp.get("position", {}):
-                raise ValueError(f"Missing '{k}' in position")
-            if k not in tp.get("orientation", {}):
-                raise ValueError(f"Missing '{k}' in orientation")
-        if "w" not in tp.get("orientation", {}):
-            raise ValueError("Missing 'w' in orientation")
-        return tp
-
     def _handle_move_ee_to_pose(self, req):
         """
         /robot/control/move_ee_to_pose — absolute pose via WebSocket trajectory.
+
+        Automatically applies a backward shift of `gripper_shift_m` along the
+        target's local -Z axis (gripper approach axis). The shift can be
+        overridden per call by including "gripper_shift" (meters) in the
+        request JSON; pass 0.0 to disable for that call.
         """
         response = RobotCommandResponse()
         rospy.loginfo(f"move_ee_to_pose request: {req.req}")
 
         try:
-            target_pose = self._parse_target_pose(req.req)
-        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            data = json.loads(req.req)
+            if "target_pose" not in data:
+                raise ValueError("Missing 'target_pose'")
+            target_pose = data["target_pose"]
+            for k in ["x", "y", "z"]:
+                if k not in target_pose.get("position", {}):
+                    raise ValueError(f"Missing '{k}' in position")
+                if k not in target_pose.get("orientation", {}):
+                    raise ValueError(f"Missing '{k}' in orientation")
+            if "w" not in target_pose.get("orientation", {}):
+                raise ValueError("Missing 'w' in orientation")
+            shift_m = 0.18
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
             response.result_code.result_code = ResultCode.INVALID_INPUT
             response.result_code.message     = f"Bad request: {e}"
             response.data = json.dumps({"success": False, "error": str(e)})
             return response
+
+        if shift_m != 0.0:
+            shifted = self._apply_gripper_shift(target_pose, shift_m)
+            rospy.loginfo(
+                f"Gripper shift {shift_m:+.3f}m (local -Z) | "
+                f"orig=({target_pose['position']['x']:.3f}, "
+                f"{target_pose['position']['y']:.3f}, "
+                f"{target_pose['position']['z']:.3f}) -> "
+                f"cmd=({shifted['position']['x']:.3f}, "
+                f"{shifted['position']['y']:.3f}, "
+                f"{shifted['position']['z']:.3f})"
+            )
+            target_pose = shifted
 
         return self._execute_trajectory_to_pose(target_pose)
 

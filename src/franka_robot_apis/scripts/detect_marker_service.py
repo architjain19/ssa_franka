@@ -289,50 +289,50 @@ class MarkerDetectionService:
                 f"{pose_base_dict['orientation']['w']:.4f})"
             )
             
-            try:
-                shift_m = 0.18
-                Q = [pose_base_dict["orientation"]["x"],
-                    pose_base_dict["orientation"]["y"],
-                    pose_base_dict["orientation"]["z"],
-                    pose_base_dict["orientation"]["w"]]
-                R = quaternion_matrix(Q)[0:3, 0:3]
-                shift_global = R.dot(np.array([0.0, 0.0, -shift_m]))
+            # try:
+            #     shift_m = 0.18
+            #     Q = [pose_base_dict["orientation"]["x"],
+            #         pose_base_dict["orientation"]["y"],
+            #         pose_base_dict["orientation"]["z"],
+            #         pose_base_dict["orientation"]["w"]]
+            #     R = quaternion_matrix(Q)[0:3, 0:3]
+            #     shift_global = R.dot(np.array([0.0, 0.0, -shift_m]))
 
-                t_shift_x = float(pose_base_dict["position"]["x"] + shift_global[0])
-                t_shift_y = float(pose_base_dict["position"]["y"] + shift_global[1])
-                t_shift_z = float(pose_base_dict["position"]["z"] + shift_global[2])
+            #     t_shift_x = float(pose_base_dict["position"]["x"] + shift_global[0])
+            #     t_shift_y = float(pose_base_dict["position"]["y"] + shift_global[1])
+            #     t_shift_z = float(pose_base_dict["position"]["z"] + shift_global[2])
 
-                # Still publish the TF for RViz visualization
-                # if self.publish_tf:
-                #     shifted_tf = TransformStamped()
-                #     shifted_tf.header.stamp = rospy.Time.now()
-                #     shifted_tf.header.frame_id = self.base_frame
-                #     shifted_tf.child_frame_id = "shifted_aruco_marker_{}".format(mid)
-                #     shifted_tf.transform.translation.x = t_shift_x
-                #     shifted_tf.transform.translation.y = t_shift_y
-                #     shifted_tf.transform.translation.z = t_shift_z
-                #     shifted_tf.transform.rotation.x = pose_base_dict["orientation"]["x"]
-                #     shifted_tf.transform.rotation.y = pose_base_dict["orientation"]["y"]
-                #     shifted_tf.transform.rotation.z = pose_base_dict["orientation"]["z"]
-                #     shifted_tf.transform.rotation.w = pose_base_dict["orientation"]["w"]
-                #     self._tf_broadcaster.sendTransform(shifted_tf)
+            #     # Still publish the TF for RViz visualization
+            #     # if self.publish_tf:
+            #     #     shifted_tf = TransformStamped()
+            #     #     shifted_tf.header.stamp = rospy.Time.now()
+            #     #     shifted_tf.header.frame_id = self.base_frame
+            #     #     shifted_tf.child_frame_id = "shifted_aruco_marker_{}".format(mid)
+            #     #     shifted_tf.transform.translation.x = t_shift_x
+            #     #     shifted_tf.transform.translation.y = t_shift_y
+            #     #     shifted_tf.transform.translation.z = t_shift_z
+            #     #     shifted_tf.transform.rotation.x = pose_base_dict["orientation"]["x"]
+            #     #     shifted_tf.transform.rotation.y = pose_base_dict["orientation"]["y"]
+            #     #     shifted_tf.transform.rotation.z = pose_base_dict["orientation"]["z"]
+            #     #     shifted_tf.transform.rotation.w = pose_base_dict["orientation"]["w"]
+            #     #     self._tf_broadcaster.sendTransform(shifted_tf)
 
-                rospy.loginfo(
-                    f"Shifted aruco marker pose in '{self.base_frame}' | "
-                    f"xyz=({t_shift_x:.4f}, {t_shift_y:.4f}, {t_shift_z:.4f})  "
-                    f"quat=({pose_base_dict['orientation']['x']:.4f}, "
-                    f"{pose_base_dict['orientation']['y']:.4f}, "
-                    f"{pose_base_dict['orientation']['z']:.4f}, "
-                    f"{pose_base_dict['orientation']['w']:.4f})"
-                )
+            #     rospy.loginfo(
+            #         f"Shifted aruco marker pose in '{self.base_frame}' | "
+            #         f"xyz=({t_shift_x:.4f}, {t_shift_y:.4f}, {t_shift_z:.4f})  "
+            #         f"quat=({pose_base_dict['orientation']['x']:.4f}, "
+            #         f"{pose_base_dict['orientation']['y']:.4f}, "
+            #         f"{pose_base_dict['orientation']['z']:.4f}, "
+            #         f"{pose_base_dict['orientation']['w']:.4f})"
+            #     )
 
-                pose_base_dict["position"]["x"] = t_shift_x
-                pose_base_dict["position"]["y"] = t_shift_y
-                pose_base_dict["position"]["z"] = t_shift_z
-                # orientation unchanged
+            #     pose_base_dict["position"]["x"] = t_shift_x
+            #     pose_base_dict["position"]["y"] = t_shift_y
+            #     pose_base_dict["position"]["z"] = t_shift_z
+            #     # orientation unchanged
 
-            except Exception as e:
-                rospy.logwarn(f"Failed to compute shifted aruco marker pose: {e}")
+            # except Exception as e:
+            #     rospy.logwarn(f"Failed to compute shifted aruco marker pose: {e}")
 
             markers_out.append({
                 "id": int(mid),
