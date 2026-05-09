@@ -65,7 +65,11 @@ class MoveEEControllerNode:
         self.position_jump_tolerance = float(rospy.get_param("~position_jump_tolerance", 0.3))
         self.ee_convergence_timeout  = float(rospy.get_param("~ee_convergence_timeout", 10.0))
         self.traj_buffer             = float(rospy.get_param("~traj_buffer", 1.0))
-
+        # Convergence / settling
+        self.settle_velocity_threshold = float(rospy.get_param("~settle_velocity_threshold", 0.005))   # m/s
+        self.settle_position_tolerance = float(rospy.get_param("~settle_position_tolerance", 0.025))   # m, looser
+        self.settle_samples            = int(rospy.get_param("~settle_samples", 5))
+        
         # Service timeouts
         self.ee_pose_svc_timeout      = float(rospy.get_param("~ee_pose_svc_timeout", 5.0))
         self.current_joints_svc_timeout = float(rospy.get_param("~current_joints_svc_timeout", 5.0))
@@ -123,7 +127,10 @@ class MoveEEControllerNode:
             f"  time_scale             : {self.time_scale}x\n"
             f"  position_tolerance     : {self.position_tolerance} m\n"
             f"  position_jump_tol      : {self.position_jump_tolerance} m\n"
-            f"  websockets             : {'OK' if _WEBSOCKETS_OK else 'MISSING - pip install aiohttp'}"
+            f"  websockets             : {'OK' if _WEBSOCKETS_OK else 'MISSING - pip install aiohttp'}\n"
+            f"  settle_vel_thresh      : {self.settle_velocity_threshold} m/s\n"
+            f"  settle_pos_tol         : {self.settle_position_tolerance} m\n"
+            f"  settle_samples         : {self.settle_samples}"
         )
 
     # =========================================================================
@@ -733,42 +740,93 @@ class MoveEEControllerNode:
 
     def _wait_for_ee_convergence(self, target_pose):
         """
-        Poll the EE pose service until position error is within tolerance.
+        Poll EE pose until convergence or timeout. Uses the franka_states
+        topic data (self.latest_o_tee) directly — no service calls.
 
-        Called immediately after all waypoints have been published (publishing
-        itself already consumed the trajectory duration), so this method does
-        NOT add an extra sleep for that duration. Only a short traj_buffer is
-        waited before starting to poll, to let the controller begin tracking.
-
-        FIX: removed the redundant `time.sleep(traj_duration)` that previously
-        caused an idle wait equal to the entire trajectory duration after all
-        waypoints had already been sent.
+        Two acceptance conditions (either succeeds):
+          (1) STRICT: position error <= position_tolerance.
+          (2) SETTLED: position error <= settle_position_tolerance AND
+              EE speed < settle_velocity_threshold for settle_samples
+              consecutive polls. This handles compliant impedance
+              controllers that have a non-zero steady-state error.
 
         Returns (reached: bool, elapsed: float)
         """
         t_start    = time.time()
         timeout_at = t_start + self.traj_buffer + self.ee_convergence_timeout
-        poll_rate  = rospy.Rate(10)
+        poll_dt    = 0.05  # 20 Hz
+
+        prev_pos      = None
+        prev_t        = None
+        min_error     = float("inf")
+        settled_count = 0
+        last_speed    = float("nan")
+
+        # Brief grace period so the controller starts tracking before we judge
+        time.sleep(min(self.traj_buffer, 0.2))
 
         while time.time() < timeout_at and not rospy.is_shutdown():
-            current_pose = self._get_ee_pose()
+            if self.latest_o_tee is None:
+                time.sleep(poll_dt)
+                continue
 
-            if current_pose is not None:
-                dx = current_pose["position"]["x"] - target_pose["position"]["x"]
-                dy = current_pose["position"]["y"] - target_pose["position"]["y"]
-                dz = current_pose["position"]["z"] - target_pose["position"]["z"]
-                pos_error = math.sqrt(dx**2 + dy**2 + dz**2)
+            cx = self.latest_o_tee[12]
+            cy = self.latest_o_tee[13]
+            cz = self.latest_o_tee[14]
 
-                if pos_error <= self.position_tolerance:
-                    elapsed = time.time() - t_start
-                    rospy.loginfo(f"EE converged in {elapsed:.2f}s (error: {pos_error:.4f}m)")
-                    return True, elapsed
-            else:
-                rospy.logwarn("Failed to get current EE pose - retrying")
+            dx = cx - target_pose["position"]["x"]
+            dy = cy - target_pose["position"]["y"]
+            dz = cz - target_pose["position"]["z"]
+            pos_error = math.sqrt(dx*dx + dy*dy + dz*dz)
+            if pos_error < min_error:
+                min_error = pos_error
 
-            poll_rate.sleep()
+            # (1) Strict convergence
+            if pos_error <= self.position_tolerance:
+                elapsed = time.time() - t_start
+                rospy.loginfo(
+                    f"EE converged (strict) in {elapsed:.2f}s "
+                    f"(error={pos_error*1000:.1f}mm)"
+                )
+                return True, elapsed
 
-        return False, time.time() - t_start
+            # (2) Settling check — needs a previous sample for velocity
+            now = time.time()
+            if prev_pos is not None and prev_t is not None:
+                dt = now - prev_t
+                if dt > 1e-4:
+                    vx = (cx - prev_pos[0]) / dt
+                    vy = (cy - prev_pos[1]) / dt
+                    vz = (cz - prev_pos[2]) / dt
+                    last_speed = math.sqrt(vx*vx + vy*vy + vz*vz)
+
+                    if (last_speed <= self.settle_velocity_threshold and
+                            pos_error <= self.settle_position_tolerance):
+                        settled_count += 1
+                        if settled_count >= self.settle_samples:
+                            elapsed = now - t_start
+                            rospy.loginfo(
+                                f"EE settled in {elapsed:.2f}s "
+                                f"(error={pos_error*1000:.1f}mm, "
+                                f"speed={last_speed*1000:.2f}mm/s)"
+                            )
+                            return True, elapsed
+                    else:
+                        settled_count = 0
+
+            prev_pos = (cx, cy, cz)
+            prev_t   = now
+            time.sleep(poll_dt)
+
+        elapsed = time.time() - t_start
+        rospy.logwarn(
+            f"EE did not converge within {elapsed:.1f}s | "
+            f"min_error={min_error*1000:.1f}mm "
+            f"(strict_tol={self.position_tolerance*1000:.1f}mm, "
+            f"settle_tol={self.settle_position_tolerance*1000:.1f}mm) | "
+            f"last_speed={last_speed*1000:.2f}mm/s"
+        )
+        return False, elapsed
 
     # =========================================================================
     # Service Handlers
