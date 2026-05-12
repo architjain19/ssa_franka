@@ -171,7 +171,7 @@ target_link_libraries(_test_cpp_node ${catkin_LIBRARIES})
 catkin_install_python(PROGRAMS
   scripts/_test_python_node.py
   scripts/get_current_robot_state_service.py
-  scripts/move_ee_controller_node.py
+  scripts/execute_impedance_trajectory_node.py
   scripts/move_ee_guarded_node.py
   scripts/get_vqa_service.py
   scripts/detect_objects_service.py

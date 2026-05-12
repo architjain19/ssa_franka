@@ -24,7 +24,7 @@
 
   <!-- franka_robot_apis Nodes -->
   <node pkg="franka_robot_apis" type="get_current_robot_state_service.py" name="robot_state_service" output="screen" />
-  <!-- <node pkg="franka_robot_apis" type="move_ee_controller_node.py" name="ee_controller" output="screen" /> -->
+  <node pkg="franka_robot_apis" type="execute_impedance_trajectory_node.py" name="execute_impedance_trajectory" output="screen" />
   <node pkg="franka_robot_apis" type="move_ee_cartesian_controller_node.py" name="ee_cartesian_controller" output="screen" />
   <node pkg="franka_robot_apis" type="move_ee_guarded_node.py" name="ee_guarded_node" output="screen" />
   <node pkg="franka_robot_apis" type="get_vqa_service.py" name="vqa_service" output="screen" />
