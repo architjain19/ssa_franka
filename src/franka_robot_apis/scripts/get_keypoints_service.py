@@ -43,7 +43,7 @@ import rospy
 from sensor_msgs.msg import Image, CameraInfo
 import ros_numpy
 
-from robot_api_interfaces.srv import RobotCommand, RobotCommandResponse
+from robot_api_interfaces.srv import RobotCommand, RobotCommandResponse, RobotCommandRequest
 from robot_api_interfaces.msg import ResultCode
 
 
@@ -127,6 +127,13 @@ class GetKeypointsNode:
             self._handle_request,
         )
 
+        # execution_impedance_trajectory service client
+        self._exec_traj_client = rospy.ServiceProxy(
+            "/robot/control/execute_impedance_trajectory",
+            RobotCommand,
+        )
+        self._exec_traj_client.wait_for_service(timeout=10.0)
+
         rospy.loginfo(
             "\nGetKeypointsNode (ROS1) ready.\n"
             f"  Service     : /robot/perception/get_keypoints\n"
@@ -136,7 +143,8 @@ class GetKeypointsNode:
             f"  CamInfo     : {self.camera_info_topic}\n"
             f"  Camera frame: {self.camera_frame}\n"
             f"  Base frame  : {self.base_frame}\n"
-            f"  DepthScale  : {self.depth_scale}"
+            f"  DepthScale  : {self.depth_scale}\n"
+            f"  Execution Impedance Trajectory service client ready: {self._exec_traj_client is not None}\n"
         )
 
     # ------------------------------------------------------------------ #
@@ -324,10 +332,66 @@ class GetKeypointsNode:
             f"({len(payload_str)} bytes). Keys: {list(dift_result.keys())}"
         )
 
-        response.result_code.result_code = ResultCode.SUCCESS
-        response.result_code.message     = "Keypoint planning succeeded."
-        response.data                    = payload_str
-        return response
+        if "trajectory_base_frame" in dift_result:
+            traj = dift_result["trajectory_base_frame"]
+            if isinstance(traj, list):
+                rospy.loginfo(f"Trajectory waypoints (base frame): {len(traj)}")
+                # for i, wp in enumerate(traj):
+                #     pos = wp.get("position_base", None)
+                #     quat = wp.get("quaternion_base_xyzw", None)
+                #     label = wp.get("label", f"wp_{i}")
+                #     if pos is not None and quat is not None:
+                #         rospy.loginfo(
+                #             f"  {label}: pos={pos} quat={quat} "
+                #             f"gripper_action={wp.get('gripper_action', 'N/A')}"
+                #         )
+                #     else:
+                #         rospy.loginfo(f"  {label}: invalid waypoint format: {wp}")
+                try:
+                    exec_req = RobotCommandRequest()
+                    exec_payload = {
+                        "waypoints": traj,
+                        "position_tolerance_m": 0.015,
+                        "orientation_tolerance_rad": 0.15,
+                        "waypoint_timeout_s": 20.0,
+                        "settle_time_s": 0.5,
+                        "publish_rate_hz": 50.0,
+                        "gripper_open_width_m": 0.085,
+                        "gripper_close_width_m": 0.0
+                    }
+                    exec_req.req = json.dumps(exec_payload)
+                    exec_resp = self._exec_traj_client(exec_req)
+                    if exec_resp.result_code.result_code == ResultCode.SUCCESS:
+                        rospy.loginfo("Successfully called execute_impedance_trajectory service with DIFT trajectory.")
+                        response.result_code.result_code = ResultCode.SUCCESS
+                        response.result_code.message     = "Keypoint planning and trajectory execution succeeded."
+                        response.data                    = exec_resp.data
+                        return response
+                    else:
+                        rospy.logwarn(f"execute_impedance_trajectory service returned failure: {exec_resp.result_code.message}")
+                        response.result_code.result_code = ResultCode.SUCCESS
+                        response.result_code.message     = "Keypoint planning succeeded, but trajectory execution failed."
+                        response.data                    = exec_resp.data
+                        return response
+                except Exception as e:
+                    rospy.logwarn(f"Failed to call execute_impedance_trajectory service: {e}")
+                    response.result_code.result_code = ResultCode.SUCCESS
+                    response.result_code.message     = "Keypoint planning succeeded, but failed to call trajectory execution service."
+                    response.data                    = json.dumps({"status": "error", "message": f"Failed to call trajectory execution service: {e}"})
+                    return response
+            else:
+                rospy.loginfo("DIFT 'trajectory_base_frame' field is not a list.")
+                response.result_code.result_code = ResultCode.SUCCESS
+                response.result_code.message     = "Keypoint planning succeeded, but no valid trajectory found."
+                response.data                    = payload_str
+                return response
+        else:
+            rospy.loginfo("No trajectory found in DIFT response.")
+            response.result_code.result_code = ResultCode.SUCCESS
+            response.result_code.message     = "Keypoint planning succeeded, but no trajectory provided."
+            response.data                    = payload_str
+            return response
+
 
     # ------------------------------------------------------------------ #
     #  DIFT WebSocket call                                                 #

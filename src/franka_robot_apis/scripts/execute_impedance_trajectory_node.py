@@ -133,7 +133,7 @@ class TrajectoryExecutorNode:
         # EE pose, abort. Prevents the impedance controller from yanking the
         # arm if someone sends a stale trajectory or wrong frame. Set to <=0
         # to disable.
-        self.max_initial_jump_m = float(rospy.get_param("~max_initial_jump_m", 0.4))
+        self.max_initial_jump_m = float(rospy.get_param("~max_initial_jump_m", 0.7))
 
         # ------------------------------------------------------------------ #
         #  TF                                                                  #
@@ -287,6 +287,12 @@ class TrajectoryExecutorNode:
         d = min(1.0, max(-1.0, d))
         return 2.0 * math.acos(d)
 
+    def _apply_z_shift(self, target_pos_arr, target_quart_arr, z_shift_m=0.20):
+        """Return a new (pos, quat) with the given vertical shift applied."""
+        shifted_pos = np.array(target_pos_arr)
+        shifted_pos[2] += z_shift_m
+        return shifted_pos, target_quart_arr
+
     def _wait_for_waypoint(self, target_pos, target_quat,
                             position_tol, orientation_tol,
                             timeout_s, publish_rate_hz):
@@ -303,6 +309,9 @@ class TrajectoryExecutorNode:
 
         target_pos_arr  = np.asarray(target_pos,  dtype=np.float64)
         target_quat_arr = self._normalize_quat(target_quat)
+        target_pos_arr, target_quat_arr = self._apply_z_shift(
+            target_pos_arr, target_quat_arr, z_shift_m=0.20,
+        )
 
         last_pos_err = None
         last_ori_err = None
