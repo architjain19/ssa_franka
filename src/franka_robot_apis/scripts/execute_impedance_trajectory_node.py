@@ -342,7 +342,7 @@ class TrajectoryExecutorNode:
             "z": r20 * vx + r21 * vy + r22 * vz,
         }
 
-    def _apply_z_shift(self, target_pos_arr, target_quart_arr, z_shift_m=0.20):
+    def _apply_z_shift(self, target_pos_arr, target_quart_arr, z_shift_m=0.18):
         """Return a new (pos, quat) with the given vertical shift applied."""
         _pos = np.array(target_pos_arr)
         _quat = np.array(target_quart_arr)
@@ -370,7 +370,7 @@ class TrajectoryExecutorNode:
         target_pos_arr  = np.asarray(target_pos,  dtype=np.float64)
         target_quat_arr = self._normalize_quat(target_quat)
         target_pos_arr, target_quat_arr = self._apply_z_shift(
-            target_pos_arr, target_quat_arr, z_shift_m=0.20,
+            target_pos_arr, target_quat_arr, z_shift_m=0.18,
         )
 
         last_pos_err = None
