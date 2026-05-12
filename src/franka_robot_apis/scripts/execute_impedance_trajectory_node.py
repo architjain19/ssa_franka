@@ -287,11 +287,71 @@ class TrajectoryExecutorNode:
         d = min(1.0, max(-1.0, d))
         return 2.0 * math.acos(d)
 
+    def _rotate_vector_by_quaternion(self, vec, quat):
+        """
+        Rotate a 3D vector by a unit quaternion (active rotation).
+
+        Given the EE orientation quaternion q (base -> EE), this maps a
+        vector expressed in the EE frame to its components in the base frame:
+            v_base = R(q) * v_ee
+        so e.g. (0, 0, 0.1) in the EE frame becomes a 10 cm step along the
+        gripper's approach axis expressed in base coordinates.
+
+        vec : dict {x,y,z} or sequence of length 3
+        quat: dict {x,y,z,w}
+        Returns: dict {x,y,z}
+        """
+
+        def _normalize_quaternion(q):
+            """
+            Normalize to unit length and canonicalize so w >= 0.
+            Falls back to identity quaternion if the norm is near zero.
+            """
+            qx, qy, qz, qw = float(q["x"]), float(q["y"]), float(q["z"]), float(q["w"])
+            norm = math.sqrt(qx**2 + qy**2 + qz**2 + qw**2)
+            if norm < 1e-10:
+                rospy.logwarn(f"Quaternion norm extremely small ({norm}), using identity")
+                return {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}
+            qx /= norm; qy /= norm; qz /= norm; qw /= norm
+            if qw < 0:
+                qx, qy, qz, qw = -qx, -qy, -qz, -qw
+            return {"x": qx, "y": qy, "z": qz, "w": qw}
+
+        qn = _normalize_quaternion(quat)
+        qx, qy, qz, qw = qn["x"], qn["y"], qn["z"], qn["w"]
+
+        if isinstance(vec, dict):
+            vx, vy, vz = float(vec["x"]), float(vec["y"]), float(vec["z"])
+        else:
+            vx, vy, vz = float(vec[0]), float(vec[1]), float(vec[2])
+
+        # Standard quaternion-to-rotation-matrix (q = w + xi + yj + zk)
+        r00 = 1.0 - 2.0 * (qy*qy + qz*qz)
+        r01 = 2.0 * (qx*qy - qw*qz)
+        r02 = 2.0 * (qx*qz + qw*qy)
+        r10 = 2.0 * (qx*qy + qw*qz)
+        r11 = 1.0 - 2.0 * (qx*qx + qz*qz)
+        r12 = 2.0 * (qy*qz - qw*qx)
+        r20 = 2.0 * (qx*qz - qw*qy)
+        r21 = 2.0 * (qy*qz + qw*qx)
+        r22 = 1.0 - 2.0 * (qx*qx + qy*qy)
+
+        return {
+            "x": r00 * vx + r01 * vy + r02 * vz,
+            "y": r10 * vx + r11 * vy + r12 * vz,
+            "z": r20 * vx + r21 * vy + r22 * vz,
+        }
+
     def _apply_z_shift(self, target_pos_arr, target_quart_arr, z_shift_m=0.20):
         """Return a new (pos, quat) with the given vertical shift applied."""
-        shifted_pos = np.array(target_pos_arr)
-        shifted_pos[2] += z_shift_m
-        return shifted_pos, target_quart_arr
+        _pos = np.array(target_pos_arr)
+        _quat = np.array(target_quart_arr)
+        shift_local = {"x": 0.0, "y": 0.0, "z": -float(z_shift_m)}
+        shift_base  = self._rotate_vector_by_quaternion(
+            shift_local, {"x": _quat[0], "y": _quat[1], "z": _quat[2], "w": _quat[3]}
+        )
+        shifted_pos = _pos + np.array([shift_base["x"], shift_base["y"], shift_base["z"]])
+        return shifted_pos, _quat
 
     def _wait_for_waypoint(self, target_pos, target_quat,
                             position_tol, orientation_tol,
