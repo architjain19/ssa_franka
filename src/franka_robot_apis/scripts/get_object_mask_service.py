@@ -94,6 +94,11 @@ class GetObjectMaskNode:
         self.sam2_timeout_sec    = float(rospy.get_param("~sam2_timeout_sec",    15.0))
         self.response_max_npz_mb = float(rospy.get_param("~response_max_npz_mb", 25.0))
 
+        # TF parameters
+        self.camera_frame  = rospy.get_param("~camera_frame",   "cam_scene_color_optical_frame")
+        self.base_frame    = rospy.get_param("~base_frame",     "panda_link0")
+        self.tf_timeout_sec= float(rospy.get_param("~tf_timeout_sec", 2.0))
+
         # ------------------------------------------------------------------ #
         #  Camera state                                                        #
         # ------------------------------------------------------------------ #
@@ -257,13 +262,41 @@ class GetObjectMaskNode:
                 "CameraInfo not yet received — using fallback intrinsics. "
                 f"fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}"
             )
+        
+        # get homogeneous transform from camera frame to robot base frame if available
+        T_base_cam = np.eye(4)  # default to identity if no TF available
+        try:
+            import tf2_ros
+            import tf2_geometry_msgs
+            tf_buffer = tf2_ros.Buffer()
+            tf_listener = tf2_ros.TransformListener(tf_buffer)
+            transform = tf_buffer.lookup_transform(
+                self.base_frame,           # target frame (robot base)
+                self.camera_frame,  # source frame (RealSense RGB camera)
+                rospy.Time(0),  # get latest available
+                rospy.Duration(self.tf_timeout_sec)  # timeout
+            )
+            tf_to_kdl = tf2_geometry_msgs.transform_to_kdl(transform)
+            kdl_rot = tf_to_kdl.M
+            kdl_pos = tf_to_kdl.p
+            hom_matrix = np.array([
+                [kdl_rot[0, 0], kdl_rot[0, 1], kdl_rot[0, 2], kdl_pos[0]],
+                [kdl_rot[1, 0], kdl_rot[1, 1], kdl_rot[1, 2], kdl_pos[1]],
+                [kdl_rot[2, 0], kdl_rot[2, 1], kdl_rot[2, 2], kdl_pos[2]],
+                [0, 0, 0, 1]
+            ])
+            T_base_cam = hom_matrix.tolist()  # convert to regular Python list for JSON serialization
+
+            rospy.loginfo("Successfully obtained T_base_cam from TF.")
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn(f"Could not obtain T_base_cam from TF: {e}. Using identity.")
 
         # --- 3. Call Grounded SAM2 /get_object_mask ---------------------
         rospy.loginfo(
             f"Calling Grounded SAM2 get_object_mask | prompt='{text_prompt}'"
         )
         sam2_result, sam2_err = self._call_sam2(
-            rgb, depth, fx, fy, cx, cy, text_prompt
+            rgb, depth, fx, fy, cx, cy, text_prompt, T_base_cam
         )
 
         if sam2_err:
@@ -325,6 +358,7 @@ class GetObjectMaskNode:
             "detected_labels":  sam2_result.get("detected_labels", []),
             "confidences":      sam2_result.get("confidences", []),
             "has_orientation":  sam2_result.get("has_orientation", False),
+            "has_T_base_cam":      sam2_result.get("has_T_base_cam", None),
         }
 
         response.result_code.result_code = ResultCode.SUCCESS
@@ -372,7 +406,7 @@ class GetObjectMaskNode:
     #  SAM2 WebSocket call                                                 #
     # ------------------------------------------------------------------ #
 
-    def _call_sam2(self, rgb, depth, fx, fy, cx, cy, text_prompt):
+    def _call_sam2(self, rgb, depth, fx, fy, cx, cy, text_prompt, T_base_cam=np.eye(4)):
         """
         Send RGB + depth + prompt to the SAM2 /get_object_mask endpoint.
 
@@ -385,6 +419,7 @@ class GetObjectMaskNode:
                 "rgb":         self._encode_rgb(rgb),
                 "depth":       self._encode_depth(depth),
                 "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+                "T_base_cam":  T_base_cam,
                 "mode":        "get_object_mask",   # tells SAM2 which endpoint mode
             }
 
