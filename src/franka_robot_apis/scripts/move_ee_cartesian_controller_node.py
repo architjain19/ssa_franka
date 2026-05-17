@@ -100,6 +100,14 @@ class MoveEEControllerNode:
             rospy.logwarn(f"Service {_joint_svc} not yet available - will retry on each call.")
         self._current_joints_proxy = rospy.ServiceProxy(_joint_svc, RobotQuery)
 
+        _set_gripper_width_svc = "/robot/control/set_gripper_width"
+        rospy.loginfo(f"Waiting for service {_set_gripper_width_svc} ...")
+        try:
+            rospy.wait_for_service(_set_gripper_width_svc, timeout=self.ee_pose_svc_timeout)
+        except rospy.ROSException:
+            rospy.logwarn(f"Service {_set_gripper_width_svc} not yet available - will retry on each call.")
+        self._set_gripper_width_proxy = rospy.ServiceProxy(_set_gripper_width_svc, RobotCommand)
+
         # ===== Shared State =====
         self.latest_o_tee    = None
         self.has_received_data = False
@@ -990,6 +998,31 @@ class MoveEEControllerNode:
     # /robot/control/reset_robot
     # -------------------------------------------------------------------------
 
+    def _set_gripper_open(self):
+        """
+        Helper method to set the gripper to open position after reset.
+        Returns a RobotCommandResponse.
+        """
+        response = RobotCommandResponse()
+        try:
+            # Assuming the gripper open position corresponds to 0.04m for both fingers
+            gripper_open_position = 0.085
+            # rosservice call /robot/control/set_gripper_width '{"req": "{\"width\": 0.085}"}'
+            req_json = json.dumps({"width": gripper_open_position})
+            set_gripper_resp = self._set_gripper_width_proxy(req_json)
+            response.result_code = set_gripper_resp.result_code
+            response.data = set_gripper_resp.data
+            if set_gripper_resp.result_code.result_code != ResultCode.SUCCESS:
+                rospy.logerr(f"Failed to open gripper: {set_gripper_resp.result_code.message}")
+            else:
+                rospy.loginfo("Gripper opened successfully.")
+        except Exception as e:
+            rospy.logerr(f"Error setting gripper state: {e}")
+            response.result_code.result_code = ResultCode.FAILURE
+            response.result_code.message     = f"Failed to open gripper: {e}"
+            response.data = json.dumps({"success": False, "error": str(e)})
+        return response
+
     def _handle_reset_robot(self, req):
         """
         /robot/control/reset_robot — move to hard-coded home pose.
@@ -1005,9 +1038,26 @@ class MoveEEControllerNode:
                 return response
 
             cmd_res = self._execute_move_to_pose(reset_pose)
-            # Convert RobotCommandResponse → RobotQueryResponse
-            response.result_code = cmd_res.result_code
-            response.data        = cmd_res.data
+            if cmd_res.result_code.result_code != ResultCode.SUCCESS:
+                rospy.logwarn("Failed to move to reset pose: " + cmd_res.result_code.message)
+                response.result_code.result_code = ResultCode.FAILURE
+                response.result_code.message     = "Failed to move to reset pose: " + cmd_res.result_code.message
+                response.data = json.dumps({"success": False, "error": "Failed to move to reset pose: " + cmd_res.result_code.message})
+                return response
+            
+            # set gripper to open after reset
+            gripper_cmd_res = self._set_gripper_open()
+            if gripper_cmd_res.result_code.result_code != ResultCode.SUCCESS:
+                rospy.logwarn("Failed to open gripper after reset: " + gripper_cmd_res.result_code.message)
+                response.result_code.result_code = ResultCode.FAILURE
+                response.result_code.message     = "Reset succeeded but failed to open gripper: " + gripper_cmd_res.result_code.message
+                response.data = json.dumps({"success": False, "error": "Failed to open gripper after reset: " + gripper_cmd_res.result_code.message})
+            else:
+                rospy.loginfo("Gripper opened successfully after reset.")
+                response.result_code.result_code = ResultCode.SUCCESS
+                response.result_code.message     = "Reset and gripper open succeeded"
+                response.data = json.dumps({"success": True, "message": "Reset and gripper open succeeded"})
+
             return response
 
         except Exception as e:
