@@ -116,10 +116,10 @@ class TrajectoryExecutorNode:
         self.ee_frame   = rospy.get_param("~ee_frame",   "panda_EE")
 
         # Default tolerances / timing — each can be overridden per request
-        self.default_position_tol_m    = float(rospy.get_param("~position_tolerance_m",     0.01))
-        self.default_orientation_tol_r = float(rospy.get_param("~orientation_tolerance_rad", 0.10))
-        self.default_waypoint_timeout  = float(rospy.get_param("~waypoint_timeout_s",       15.0))
-        self.default_settle_time       = float(rospy.get_param("~settle_time_s",            0.3))
+        self.default_position_tol_m    = float(rospy.get_param("~position_tolerance_m",     0.015))
+        self.default_orientation_tol_r = float(rospy.get_param("~orientation_tolerance_rad", 0.15))
+        self.default_waypoint_timeout  = float(rospy.get_param("~waypoint_timeout_s",       20.0))
+        self.default_settle_time       = float(rospy.get_param("~settle_time_s",            0.5))
         self.default_publish_rate_hz   = float(rospy.get_param("~publish_rate_hz",          50.0))
 
         # Default gripper widths (meters). Franka FE3 gripper: 0.0 closed, ~0.085 open.
