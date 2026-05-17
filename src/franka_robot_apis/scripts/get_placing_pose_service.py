@@ -488,13 +488,13 @@ class GetPlacementPoseNode:
             # target object centroid height
             target_obj_height = float(target_pc[:, 2].max() - target_pc[:, 2].min())
             rospy.loginfo(f"Target object height: {target_obj_height:.4f}m")
-            # base object top height
-            base_top_height = float(base_pc[:, 2].max())
-            rospy.loginfo(f"Base object top height: {base_top_height:.4f}m")
+            # base object height
+            base_obj_height = float(base_pc[:, 2].max() - base_pc[:, 2].min())
+            rospy.loginfo(f"Base object height: {base_obj_height:.4f}m")
 
-            if t_base[2] < 0.0:
-                t_base[2] = target_obj_height
-            t_base[2] += base_top_height  # add clearance above target
+            # if t_base[2] < 0.0:
+            #     t_base[2] = 0.0
+            t_base[2] = target_obj_height + base_obj_height*0.5 + 0.02
             rospy.loginfo(f"Adjusted Z for safety: {t_base[2]:.4f}m")
             
             # Post-multiply by 180° around X to fix AnyGrasp EE convention
