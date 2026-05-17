@@ -16,6 +16,8 @@ Request (JSON string in .req field):
     "text_prompt"          : "white cloth on table",      # SAM2 prompt
     "task"                 : "fold the cloth in half",    # natural-language task
     "current_ee_pose_base" : [[...4x4...]]                # optional, 4x4 list
+    "num_candidates"       : 5                           # optional, int
+    "num_path_waypoints"   : 20                          # optional, int
 }
 
 Response (JSON string in .data field):
@@ -222,6 +224,15 @@ class GetKeypointsNode:
         task        = (req_data.get("task")        or "").strip()
         if not task:
             return self._fail(response, "Missing required field 'task' (non-empty string).")
+        
+        # Optional: client may specify number of candidates and path waypoints
+        num_req_candidates = req_data.get("num_candidates", 50)
+        if not isinstance(num_req_candidates, int) or num_req_candidates < 5 or num_req_candidates > 100:
+            return self._fail(response, f"'num_candidates' must be a positive integer between 5 and 100, got {num_req_candidates}.")
+
+        num_req_path_waypoints = req_data.get("num_path_waypoints", 20)
+        if not isinstance(num_req_path_waypoints, int) or num_req_path_waypoints < 2 or num_req_path_waypoints > 20:
+            return self._fail(response, f"'num_path_waypoints' must be a positive integer between 2 and 20, got {num_req_path_waypoints}.")
 
         # Optional: client may pass a current EE pose in base frame (4x4 list)
         current_ee_pose_base = req_data.get("current_ee_pose_base", None)
@@ -305,7 +316,7 @@ class GetKeypointsNode:
         )
         dift_result, dift_err = self._call_dift(
             rgb, depth, fx, fy, cx, cy,
-            text_prompt, task, T_base_cam, current_ee_pose_base,
+            text_prompt, task, T_base_cam, current_ee_pose_base, num_req_candidates, num_req_path_waypoints
         )
 
         if dift_err:
@@ -398,7 +409,7 @@ class GetKeypointsNode:
     # ------------------------------------------------------------------ #
 
     def _call_dift(self, rgb, depth, fx, fy, cx, cy,
-                   text_prompt, task, T_base_cam, current_ee_pose_base):
+                   text_prompt, task, T_base_cam, current_ee_pose_base, num_req_candidates=50, num_req_path_waypoints=10):
         """
         Send RGB + depth + intrinsics + T_base_cam + task/prompt to the DIFT
         /plan_action endpoint.
@@ -415,6 +426,8 @@ class GetKeypointsNode:
                 "T_base_cam":   T_base_cam,
                 "text_prompt":  text_prompt,
                 "task":         task,
+                "num_candidates": num_req_candidates,
+                "num_path_waypoints": num_req_path_waypoints,
             }
             if current_ee_pose_base is not None:
                 payload["current_ee_pose_base"] = current_ee_pose_base
