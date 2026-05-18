@@ -116,7 +116,7 @@ class MoveEEControllerNode:
         self._traj_lock = threading.Lock()
 
         self.reset_robot_pose_config = {
-            "position":    {"x": 0.3519224559823385, "y": -0.05562486079937977, "z": 0.4605192035135702},
+            "position":    {"x": 0.35, "y": 0.0, "z": 0.65},
             "orientation": {"x": 0.9381642040183052, "y": -0.030248377974380142, "z": 0.344855954687452, "w": 0.0027078488186944366},
         }
 
