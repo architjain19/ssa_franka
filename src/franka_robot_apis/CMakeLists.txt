@@ -172,7 +172,6 @@ catkin_install_python(PROGRAMS
   scripts/_test_python_node.py
   scripts/get_current_robot_state_service.py
   scripts/execute_impedance_trajectory_node.py
-  scripts/move_ee_guarded_node.py
   scripts/get_vqa_service.py
   scripts/detect_objects_service.py
   scripts/get_object_mask_service.py
