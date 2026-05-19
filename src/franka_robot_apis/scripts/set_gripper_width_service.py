@@ -84,7 +84,7 @@ from robot_api_interfaces.msg import ResultCode
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_WIDTH_M       = 0.085   # metres at rPR = 0   (open,   2F-85)
 DEFAULT_MIN_WIDTH_M       = 0.000   # metres at rPR = 255 (closed, 2F-85)
-DEFAULT_SPEED             = 255     # rSP: 0 (slow) - 255 (fast)
+DEFAULT_SPEED             = 190     # rSP: 0 (slow) - 255 (fast)
 DEFAULT_FORCE             = 150     # rFR: 0 (light) - 255 (max)
 DEFAULT_DURATION          = 3.0     # seconds to wait for motion completion
 DEFAULT_POSITION_TOL_PR   = 5       # ±rPR counts to accept as "reached"
