@@ -2,7 +2,7 @@
 """
 ROS1 Noetic service node: DIFT Keypoint Planner Pipeline
 ---------------------------------------------------------
-Service: /robot/perception/get_keypoints  (robot_api_interfaces/RobotCommand)
+Service: /robot/perception/detect_keypoints  (robot_api_interfaces/RobotCommand)
 
 Pipeline:
   1. Capture latest RGB-D + intrinsics from the RealSense
@@ -24,9 +24,9 @@ Response (JSON string in .data field):
     Forwarded verbatim from the DIFT server (no post-processing).
 
 ROS1 usage:
-    rosrun franka_robot_apis get_keypoints_service.py
+    rosrun franka_robot_apis detect_keypoints_service.py
 
-    rosservice call /robot/perception/get_keypoints '{"req": "{\"text_prompt\":\"white cloth\",\"task\":\"fold the cloth in half\"}"}'
+    rosservice call /robot/perception/detect_keypoints '{"req": "{\"text_prompt\":\"white cloth\",\"task\":\"fold the cloth in half\"}"}'
 """
 
 import json
@@ -52,7 +52,7 @@ from robot_api_interfaces.msg import ResultCode
 # ---------------------------------------------------------------------------
 # Main service class
 # ---------------------------------------------------------------------------
-class GetKeypointsNode:
+class DetectKeypointsNode:
     """
     ROS1 service node wrapping the DIFT /plan_action WebSocket endpoint.
 
@@ -124,21 +124,14 @@ class GetKeypointsNode:
         #  Service                                                             #
         # ------------------------------------------------------------------ #
         self._service = rospy.Service(
-            "/robot/perception/get_keypoints",
+            "/robot/perception/detect_keypoints",
             RobotCommand,
             self._handle_request,
         )
 
-        # execution_impedance_trajectory service client
-        self._exec_traj_client = rospy.ServiceProxy(
-            "/robot/control/execute_impedance_trajectory",
-            RobotCommand,
-        )
-        self._exec_traj_client.wait_for_service(timeout=10.0)
-
         rospy.loginfo(
-            "\nGetKeypointsNode (ROS1) ready.\n"
-            f"  Service     : /robot/perception/get_keypoints\n"
+            "\nDetectKeypointsNode (ROS1) ready.\n"
+            f"  Service     : /robot/perception/detect_keypoints\n"
             f"  DIFT        : {self.dift_url}\n"
             f"  RGB         : {self.rgb_topic}\n"
             f"  Depth       : {self.depth_topic}\n"
@@ -146,7 +139,6 @@ class GetKeypointsNode:
             f"  Camera frame: {self.camera_frame}\n"
             f"  Base frame  : {self.base_frame}\n"
             f"  DepthScale  : {self.depth_scale}\n"
-            f"  Execution Impedance Trajectory service client ready: {self._exec_traj_client is not None}\n"
         )
 
     # ------------------------------------------------------------------ #
@@ -332,17 +324,16 @@ class GetKeypointsNode:
         # --- 5. Log the payload and forward verbatim --------------------
         try:
             payload_str = json.dumps(dift_result)
+            rospy.loginfo(f"DIFT response: {payload_str}")
+            return RobotCommandResponse(
+                result_code=ResultCode(result_code=0, message="DIFT call successful."),
+                data=payload_str,
+            )
         except (TypeError, ValueError) as e:
             return self._fail(
                 response,
                 f"DIFT response is not JSON-serializable: {e}"
             )
-
-        rospy.loginfo(f"DIFT response: {payload_str}")
-        return RobotCommandResponse(
-            result_code=ResultCode(result_code=1, message="DIFT call successful."),
-            data=payload_str,
-        )
 
 
     # ------------------------------------------------------------------ #
@@ -448,7 +439,7 @@ class GetKeypointsNode:
         """
         Populate *response* as a failure and log the error.
         """
-        rospy.logerr(f"get_keypoints service error: {msg}")
+        rospy.logerr(f"detect_keypoints service error: {msg}")
         response.result_code.result_code = ResultCode.FAILURE
         response.result_code.message     = msg
         response.data = json.dumps({"status": "error", "message": msg})
@@ -464,21 +455,21 @@ class GetKeypointsNode:
 
 
 def main():
-    """Initialize and spin the GetKeypointsNode."""
-    rospy.init_node("get_keypoints_service", anonymous=False)
+    """Initialize and spin the DetectKeypointsNode."""
+    rospy.init_node("detect_keypoints_service", anonymous=False)
 
     try:
-        rospy.loginfo("Creating GetKeypointsNode ...")
-        node = GetKeypointsNode()
-        rospy.loginfo("GetKeypointsNode spinning ...")
+        rospy.loginfo("Creating DetectKeypointsNode ...")
+        node = DetectKeypointsNode()
+        rospy.loginfo("DetectKeypointsNode spinning ...")
         node.spin()
 
     except rospy.ROSInterruptException:
-        rospy.loginfo("ROS interrupt — shutting down GetKeypointsNode.")
+        rospy.loginfo("ROS interrupt — shutting down DetectKeypointsNode.")
     except Exception as e:
         rospy.logerr(f"Fatal error: {e}\n{traceback.format_exc()}")
     finally:
-        rospy.loginfo("GetKeypointsNode shutdown complete.")
+        rospy.loginfo("DetectKeypointsNode shutdown complete.")
 
 
 if __name__ == "__main__":
