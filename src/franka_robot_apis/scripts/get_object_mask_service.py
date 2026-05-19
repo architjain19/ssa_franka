@@ -79,9 +79,9 @@ class GetObjectMaskNode:
         )
 
         # Camera topics — same RealSense serial used in detect_objects node
-        self.rgb_topic         = rospy.get_param("~rgb_topic",         "/realsense/scene/color/image_raw")
-        self.depth_topic       = rospy.get_param("~depth_topic",       "/realsense/scene/aligned_depth_to_color/image_raw")
-        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/realsense/scene/aligned_depth_to_color/camera_info")
+        self.rgb_topic         = rospy.get_param("~rgb_topic",         "/zed/scene/color/image_raw")
+        self.depth_topic       = rospy.get_param("~depth_topic",       "/zed/scene/aligned_depth_to_color/image_raw")
+        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/zed/scene/aligned_depth_to_color/camera_info")
 
         # Fallback intrinsics (used only if camera_info never arrives)
         self.fx_default = float(rospy.get_param("~fx", 752.0038452148438))
@@ -95,7 +95,7 @@ class GetObjectMaskNode:
         self.response_max_npz_mb = float(rospy.get_param("~response_max_npz_mb", 25.0))
 
         # TF parameters
-        self.camera_frame  = rospy.get_param("~camera_frame",   "cam_scene_color_optical_frame")
+        self.camera_frame  = rospy.get_param("~camera_frame",   "zed_scene_left_optical_frame")
         self.base_frame    = rospy.get_param("~base_frame",     "panda_link0")
         self.tf_timeout_sec= float(rospy.get_param("~tf_timeout_sec", 2.0))
 

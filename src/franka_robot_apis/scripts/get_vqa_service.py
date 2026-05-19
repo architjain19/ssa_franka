@@ -147,7 +147,7 @@ class VQAServiceNode:
         # ------------------------------------------------------------------
         self.qwen_host           = rospy.get_param("~qwen_host",          "10.158.54.164")
         self.qwen_port           = rospy.get_param("~qwen_port",          8000)
-        self.default_image_topic = rospy.get_param("~default_image_topic", "/realsense/scene/color/image_raw")
+        self.default_image_topic = rospy.get_param("~default_image_topic", "/zed/scene/color/image_raw")
         self.image_cache_timeout = float(rospy.get_param("~image_cache_timeout", 1.0))
         self.default_max_tokens  = int(rospy.get_param("~default_max_tokens",  512))
         self.default_temperature = float(rospy.get_param("~default_temperature", 0.1))

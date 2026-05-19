@@ -240,7 +240,7 @@ class GetPlacementPoseNode:
 
         # TF frames
         self.base_frame   = rospy.get_param("~base_frame",   "panda_link0")
-        self.camera_frame = rospy.get_param("~camera_frame", "cam_scene_color_optical_frame")
+        self.camera_frame = rospy.get_param("~camera_frame", "zed_scene_left_optical_frame")
 
         # Defaults
         self.default_init_k       = int(rospy.get_param("~init_k_val",      20))

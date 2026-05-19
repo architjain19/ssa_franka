@@ -20,7 +20,10 @@
         args="/dev/ttyUSB0" output="screen" />
 
   <!-- Stream Camera ROS Client Node -->
-  <node pkg="franka_robot_apis" type="stream_camera_client_node.py" name="stream_camera_client" output="screen" />
+  <!-- <node pkg="franka_robot_apis" type="stream_camera_client_node.py" name="stream_camera_client" output="screen" /> -->
+
+  <!-- Stream ZED Camera ROS Client Node -->
+  <node pkg="franka_robot_apis" type="stream_zed_camera_client_node.py" name="stream_zed_camera_client" output="screen" />
 
   <!-- franka_robot_apis Nodes -->
   <node pkg="franka_robot_apis" type="get_current_robot_state_service.py" name="robot_state_service" output="screen" />

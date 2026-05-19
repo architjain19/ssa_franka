@@ -182,3 +182,9 @@ rostopic pub /Robotiq2FGripperRobotOutput robotiq_2f_gripper_control/Robotiq2FGr
 
 # TO ACTIVATE AND SOURCE THE ENVIRONMENT
 conda activate env_franka && source ~/archit/ssa_ws/devel/setup.zsh && export PATH="/home/daphne/miniconda3/envs/env_franka/bin:$PATH"
+
+
+cd /usr/local/zed
+python get_python_api.py
+python -c "import pyzed.sl as sl; print('OK, devices:', [d.serial_number for d in sl.Camera.get_device_list()])"
+python3 -c "\nimport numpy as np\nprint(np.__version__)\n"

@@ -64,9 +64,9 @@ class MarkerDetectionService:
     def __init__(self):
         # -------- Parameters --------
         self.service_name       = rospy.get_param("~service_name",       "/robot/perception/detect_markers")
-        self.color_topic        = rospy.get_param("~color_topic",        "/realsense/scene/color/image_raw")
-        self.camera_info_topic  = rospy.get_param("~camera_info_topic",  "/realsense/scene/color/camera_info")
-        self.depth_topic        = rospy.get_param("~depth_topic",        "/realsense/scene/aligned_depth_to_color/image_raw")
+        self.color_topic        = rospy.get_param("~color_topic",        "/zed/scene/color/image_raw")
+        self.camera_info_topic  = rospy.get_param("~camera_info_topic",  "/zed/scene/color/camera_info")
+        self.depth_topic        = rospy.get_param("~depth_topic",        "/zed/scene/aligned_depth_to_color/image_raw")
         self.marker_size        = float(rospy.get_param("~marker_size",  0.08))
         self.target_ids         = list(rospy.get_param("~target_ids",    [1, 2, 3, 4, 5]))
         self.base_frame         = rospy.get_param("~base_frame",         "panda_link0")

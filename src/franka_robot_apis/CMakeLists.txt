@@ -176,6 +176,7 @@ catkin_install_python(PROGRAMS
   scripts/detect_objects_service.py
   scripts/get_object_mask_service.py
   scripts/stream_camera_client_node.py
+  scripts/stream_zed_camera_client_node.py
   scripts/set_gripper_width_service.py
   scripts/move_ee_cartesian_controller_node.py
   scripts/get_placing_pose_service.py
