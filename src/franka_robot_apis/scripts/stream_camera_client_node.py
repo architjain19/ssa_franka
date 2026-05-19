@@ -20,7 +20,8 @@ from agentlace.action import ActionClient, ActionConfig
 # ── Camera serials ────────────────────────────────────────────────────────────
 SCENE_SERIAL = "947122060531"   # D415 — scene
 WRIST_SERIAL = "123622270802"   # D405 — wrist
-SERIALS = [WRIST_SERIAL, SCENE_SERIAL]
+# SERIALS = [WRIST_SERIAL, SCENE_SERIAL]
+SERIALS = [SCENE_SERIAL]
 
 CAMERA_ROLES = {
     WRIST_SERIAL: "wrist",
