@@ -66,7 +66,7 @@ class GetKeypointsNode:
         #  Parameters                                                          #
         # ------------------------------------------------------------------ #
         self.dift_url = rospy.get_param(
-            "~dift_url", "ws://10.158.54.164:8769/plan_action"
+            "~dift_url", "ws://10.158.54.164:8769/select_keypoint"
         )
 
         # Camera topics — same RealSense serial used in detect_objects node
@@ -338,52 +338,11 @@ class GetKeypointsNode:
                 f"DIFT response is not JSON-serializable: {e}"
             )
 
-        rospy.loginfo(
-            f"DIFT response payload received "
-            f"({len(payload_str)} bytes). Keys: {list(dift_result.keys())}"
+        rospy.loginfo(f"DIFT response: {payload_str}")
+        return RobotCommandResponse(
+            result_code=ResultCode(result_code=1, message="DIFT call successful."),
+            data=payload_str,
         )
-
-        if "trajectory_base_frame" in dift_result:
-            traj = dift_result["trajectory_base_frame"]
-            if isinstance(traj, list):
-                rospy.loginfo(f"Trajectory waypoints (base frame): {len(traj)}")
-                rospy.loginfo(f"Full DIFT payload: {payload_str}")
-
-                # Build per-stage waypoint lists
-                stages = dift_result.get("stages", [])
-                stage_waypoint_lists = [
-                    [
-                        {
-                            "position_base":        wp["position_base"],
-                            "quaternion_base_xyzw": wp["quaternion_base_xyzw"],
-                            "gripper_action":       wp["gripper_action"],
-                            "label":                wp["label"],
-                        }
-                        for wp in stage["waypoints"]
-                    ]
-                    for stage in stages
-                ]
-
-                response.result_code.result_code = ResultCode.SUCCESS
-                response.result_code.message     = "Keypoint planning succeeded."
-                response.data                    = json.dumps({
-                    "status":   "success",
-                    "message":  "Keypoint planning and trajectory execution succeeded.",
-                    "waypoints": stage_waypoint_lists,
-                })
-                return response
-            else:
-                rospy.loginfo("DIFT 'trajectory_base_frame' field is not a list.")
-                response.result_code.result_code = ResultCode.FAILURE
-                response.result_code.message     = "Keypoint planning succeeded, but no valid trajectory found from ReKep Trajectory Planner."
-                response.data                    = payload_str
-                return response
-        else:
-            rospy.loginfo("No trajectory found in DIFT response.")
-            response.result_code.result_code = ResultCode.FAILURE
-            response.result_code.message     = "Keypoint planning succeeded, but no trajectory provided by ReKep Trajectory Planner."
-            response.data                    = payload_str
-            return response
 
 
     # ------------------------------------------------------------------ #
