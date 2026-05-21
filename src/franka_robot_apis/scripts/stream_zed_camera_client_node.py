@@ -40,8 +40,8 @@ from agentlace.action import ActionClient, ActionConfig
 SCENE_SERIAL = 39668372    # ZED 2i — scene
 WRIST_SERIAL = 16744838    # ZED-Mini — wrist
 
-# SERIALS = [WRIST_SERIAL, SCENE_SERIAL]
-SERIALS = [SCENE_SERIAL]
+SERIALS = [SCENE_SERIAL, WRIST_SERIAL]
+# SERIALS = [SCENE_SERIAL]
 
 CAMERA_ROLES = {
     WRIST_SERIAL: "wrist",
@@ -60,7 +60,8 @@ for s in SERIALS:
         f"cam_{s}_meta",
         f"cam_{s}_extrinsics",
     ]
-
+observation_keys.pop(observation_keys.index(f"cam_{WRIST_SERIAL}_extrinsics"))
+print(observation_keys)
 action_keys = ["command"]
 
 QUEUE_SIZE_IMAGE = 1

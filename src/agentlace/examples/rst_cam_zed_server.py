@@ -340,7 +340,8 @@ def main():
     intrinsics_cache = {}    # serial -> {"color": dict, "depth": dict}
     image_holders = {}       # serial -> {"img": sl.Mat, "depth": sl.Mat}
 
-    for serial, model in devs:
+    ordered = sorted(devs, key=lambda d: 0 if CAMERA_ROLES.get(d[0]) == "scene" else 1)
+    for serial, model in ordered:
         if serial not in CAMERA_ROLES:
             print(f"  {serial}: unknown serial — skipping")
             continue
