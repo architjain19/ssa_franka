@@ -1,32 +1,51 @@
 #!/usr/bin/env python3
 """
-ROS1 Noetic service node: DIFT Keypoint Planner Pipeline
----------------------------------------------------------
-Service: /robot/perception/detect_keypoints  (robot_api_interfaces/RobotCommand)
+ROS1 Noetic service node: DIFT Keypoint + Planner Pipeline
+-----------------------------------------------------------
+This node exposes TWO services backed by the same DIFT server:
 
-Pipeline:
+  1. /robot/perception/get_keypoints
+        - Calls the DIFT /select_keypoint endpoint.
+        - Forwards the response verbatim to the caller.
+
+  2. /robot/perception/get_keypoints_trajectory
+        - Calls the DIFT /plan_action endpoint.
+        - If a 'trajectory_base_frame' is returned, forwards it to
+          /robot/control/execute_impedance_trajectory for execution.
+
+Both services share the same RGB-D capture, intrinsics, and TF-lookup
+pipeline.
+
+Pipeline (shared):
   1. Capture latest RGB-D + intrinsics from the RealSense
   2. Look up TF (base_frame <- camera_frame) -> T_base_cam (4x4)
   3. Send RGB-D + intrinsics + T_base_cam + task/prompt to the DIFT
-     WebSocket server (/plan_action)
-  4. Log the returned payload via rospy and forward it verbatim to the caller
+     WebSocket server (endpoint depends on which service was called)
+  4. Log the returned payload and forward it to the caller (the
+     trajectory variant also executes the returned trajectory).
 
 Request (JSON string in .req field):
 {
     "text_prompt"          : "white cloth on table",      # SAM2 prompt
     "task"                 : "fold the cloth in half",    # natural-language task
     "current_ee_pose_base" : [[...4x4...]]                # optional, 4x4 list
-    "num_candidates"       : 5                           # optional, int
-    "num_path_waypoints"   : 20                          # optional, int
+    "num_candidates"       : 50                           # optional, int (5-100)
+    "num_path_waypoints"   : 20                           # optional, int (2-20)
 }
 
 Response (JSON string in .data field):
-    Forwarded verbatim from the DIFT server (no post-processing).
+    Forwarded verbatim from the DIFT server (no post-processing for
+    /get_keypoints; the trajectory service additionally invokes
+    the execution service).
 
 ROS1 usage:
     rosrun franka_robot_apis detect_keypoints_service.py
 
-    rosservice call /robot/perception/detect_keypoints '{"req": "{\"text_prompt\":\"white cloth\",\"task\":\"fold the cloth in half\"}"}'
+    rosservice call /robot/perception/get_keypoints \\
+        '{"req": "{\\"text_prompt\\":\\"white cloth\\",\\"task\\":\\"fold the cloth in half\\"}"}'
+
+    rosservice call /robot/perception/get_keypoints_trajectory \\
+        '{"req": "{\\"text_prompt\\":\\"white cloth\\",\\"task\\":\\"fold the cloth in half\\"}"}'
 """
 
 import json
@@ -45,7 +64,9 @@ import rospy
 from sensor_msgs.msg import Image, CameraInfo
 import ros_numpy
 
-from robot_api_interfaces.srv import RobotCommand, RobotCommandResponse, RobotCommandRequest
+from robot_api_interfaces.srv import (
+    RobotCommand, RobotCommandResponse, RobotCommandRequest,
+)
 from robot_api_interfaces.msg import ResultCode
 
 
@@ -54,19 +75,34 @@ from robot_api_interfaces.msg import ResultCode
 # ---------------------------------------------------------------------------
 class DetectKeypointsNode:
     """
-    ROS1 service node wrapping the DIFT /plan_action WebSocket endpoint.
+    ROS1 service node wrapping two DIFT WebSocket endpoints:
+      - /select_keypoint  (exposed as /robot/perception/get_keypoints)
+      - /plan_action      (exposed as /robot/perception/get_keypoints_trajectory)
 
     Captures an RGB + depth frame, gathers intrinsics and T_base_cam, ships
     everything to the DIFT server alongside the user's text_prompt + task,
-    and forwards the response verbatim to the caller.
+    and forwards the response to the caller. The trajectory variant also
+    forwards any returned trajectory to the impedance-trajectory executor.
     """
 
     def __init__(self):
         # ------------------------------------------------------------------ #
         #  Parameters                                                          #
         # ------------------------------------------------------------------ #
-        self.dift_url = rospy.get_param(
-            "~dift_url", "ws://10.158.54.164:8769/select_keypoint"
+        # Base WebSocket URL for the DIFT server. Endpoints are appended per
+        # service: <base>/select_keypoint and <base>/plan_action.
+        self.dift_base_url = rospy.get_param(
+            "~dift_base_url", "ws://10.158.54.164:8769"
+        ).rstrip("/")
+
+        # Allow individual endpoint overrides if needed.
+        self.dift_select_keypoint_url = rospy.get_param(
+            "~dift_select_keypoint_url",
+            f"{self.dift_base_url}/select_keypoint",
+        )
+        self.dift_plan_action_url = rospy.get_param(
+            "~dift_plan_action_url",
+            f"{self.dift_base_url}/plan_action",
         )
 
         # Camera topics — same RealSense serial used in detect_objects node
@@ -105,6 +141,13 @@ class DetectKeypointsNode:
         self._cam_lock            = threading.Lock()
 
         # ------------------------------------------------------------------ #
+        #  TF buffer (set up once, reused for every request)                   #
+        # ------------------------------------------------------------------ #
+        import tf2_ros  # imported here so module-level import errors don't break param parsing
+        self._tf_buffer   = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer)
+
+        # ------------------------------------------------------------------ #
         #  Subscriptions                                                       #
         # ------------------------------------------------------------------ #
         rospy.Subscriber(
@@ -121,24 +164,32 @@ class DetectKeypointsNode:
         )
 
         # ------------------------------------------------------------------ #
-        #  Service                                                             #
+        #  Services                                                            #
         # ------------------------------------------------------------------ #
-        self._service = rospy.Service(
-            "/robot/perception/detect_keypoints",
+        self._keypoint_service = rospy.Service(
+            "/robot/perception/get_keypoints",
             RobotCommand,
-            self._handle_request,
+            self._handle_detect_keypoints,
         )
+        self._trajectory_service = rospy.Service(
+            "/robot/perception/get_keypoints_trajectory",
+            RobotCommand,
+            self._handle_get_keypoints_trajectory,
+        )
+
 
         rospy.loginfo(
             "\nDetectKeypointsNode (ROS1) ready.\n"
-            f"  Service     : /robot/perception/detect_keypoints\n"
-            f"  DIFT        : {self.dift_url}\n"
-            f"  RGB         : {self.rgb_topic}\n"
-            f"  Depth       : {self.depth_topic}\n"
-            f"  CamInfo     : {self.camera_info_topic}\n"
-            f"  Camera frame: {self.camera_frame}\n"
-            f"  Base frame  : {self.base_frame}\n"
-            f"  DepthScale  : {self.depth_scale}\n"
+            f"  Service (keypoints)         : /robot/perception/get_keypoints\n"
+            f"  Service (keypoints+traj)    : /robot/perception/get_keypoints_trajectory\n"
+            f"  DIFT /select_keypoint       : {self.dift_select_keypoint_url}\n"
+            f"  DIFT /plan_action           : {self.dift_plan_action_url}\n"
+            f"  RGB                         : {self.rgb_topic}\n"
+            f"  Depth                       : {self.depth_topic}\n"
+            f"  CamInfo                     : {self.camera_info_topic}\n"
+            f"  Camera frame                : {self.camera_frame}\n"
+            f"  Base frame                  : {self.base_frame}\n"
+            f"  DepthScale                  : {self.depth_scale}\n"
         )
 
     # ------------------------------------------------------------------ #
@@ -196,14 +247,54 @@ class DetectKeypointsNode:
                 )
 
     # ------------------------------------------------------------------ #
-    #  Service handler                                                     #
+    #  Service handlers                                                    #
     # ------------------------------------------------------------------ #
 
-    def _handle_request(self, request):
+    def _handle_detect_keypoints(self, request):
         """
-        rospy.Service callback - called in a dedicated thread per request.
+        Handler for /robot/perception/get_keypoints.
+
+        Calls the DIFT /select_keypoint endpoint and forwards the response
+        verbatim.
         """
-        rospy.loginfo(f"Get-keypoints request received: {request.req}")
+        return self._run_pipeline(
+            request,
+            dift_url=self.dift_select_keypoint_url,
+            execute_trajectory=False,
+            log_tag="get_keypoints",
+        )
+
+    def _handle_get_keypoints_trajectory(self, request):
+        """
+        Handler for /robot/perception/get_keypoints_trajectory.
+
+        Calls the DIFT /plan_action endpoint. If a 'trajectory_base_frame'
+        is returned, forwards it to the impedance-trajectory executor.
+        """
+        return self._run_pipeline(
+            request,
+            dift_url=self.dift_plan_action_url,
+            execute_trajectory=True,
+            log_tag="get_keypoints_trajectory",
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Shared pipeline                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _run_pipeline(self, request, dift_url, execute_trajectory, log_tag):
+        """
+        Shared request-handling pipeline:
+
+          1. Parse + validate request JSON.
+          2. Wait for a fresh RGB-D frame.
+          3. Look up T_base_cam from TF.
+          4. Call the appropriate DIFT endpoint.
+          5. Either forward the response verbatim (get_keypoints) or
+             dispatch the returned trajectory to the impedance-trajectory
+             executor (get_keypoints_trajectory).
+        """
+        rospy.loginfo(f"[{log_tag}] request received: {request.req}")
         response = RobotCommandResponse()
 
         # --- 1. Parse request -------------------------------------------
@@ -216,15 +307,21 @@ class DetectKeypointsNode:
         task        = (req_data.get("task")        or "").strip()
         if not task:
             return self._fail(response, "Missing required field 'task' (non-empty string).")
-        
+
         # Optional: client may specify number of candidates and path waypoints
         num_req_candidates = req_data.get("num_candidates", 50)
         if not isinstance(num_req_candidates, int) or num_req_candidates < 5 or num_req_candidates > 100:
-            return self._fail(response, f"'num_candidates' must be a positive integer between 5 and 100, got {num_req_candidates}.")
+            return self._fail(
+                response,
+                f"'num_candidates' must be a positive integer between 5 and 100, got {num_req_candidates}."
+            )
 
         num_req_path_waypoints = req_data.get("num_path_waypoints", 20)
         if not isinstance(num_req_path_waypoints, int) or num_req_path_waypoints < 2 or num_req_path_waypoints > 20:
-            return self._fail(response, f"'num_path_waypoints' must be a positive integer between 2 and 20, got {num_req_path_waypoints}.")
+            return self._fail(
+                response,
+                f"'num_path_waypoints' must be a positive integer between 2 and 20, got {num_req_path_waypoints}."
+            )
 
         # Optional: client may pass a current EE pose in base frame (4x4 list)
         current_ee_pose_base = req_data.get("current_ee_pose_base", None)
@@ -244,7 +341,7 @@ class DetectKeypointsNode:
                 )
 
         # --- 2. Wait for camera frames ----------------------------------
-        rospy.loginfo(f"Waiting up to {self.camera_wait_sec}s for camera frames ...")
+        rospy.loginfo(f"[{log_tag}] Waiting up to {self.camera_wait_sec}s for camera frames ...")
         deadline   = time.time() + self.camera_wait_sec
         has_frames = False
         while time.time() < deadline:
@@ -274,41 +371,18 @@ class DetectKeypointsNode:
             )
 
         # --- 3. Get T_base_cam from TF (camera frame -> robot base frame)
-        T_base_cam = np.eye(4).tolist()  # default to identity if no TF available
-        try:
-            import tf2_ros
-            import tf2_geometry_msgs
-            tf_buffer = tf2_ros.Buffer()
-            tf_listener = tf2_ros.TransformListener(tf_buffer)
-            transform = tf_buffer.lookup_transform(
-                self.base_frame,            # target frame (robot base)
-                self.camera_frame,          # source frame (RealSense RGB camera)
-                rospy.Time(0),              # latest available
-                rospy.Duration(self.tf_timeout_sec)
-            )
-            tf_to_kdl = tf2_geometry_msgs.transform_to_kdl(transform)
-            kdl_rot = tf_to_kdl.M
-            kdl_pos = tf_to_kdl.p
-            hom_matrix = np.array([
-                [kdl_rot[0, 0], kdl_rot[0, 1], kdl_rot[0, 2], kdl_pos[0]],
-                [kdl_rot[1, 0], kdl_rot[1, 1], kdl_rot[1, 2], kdl_pos[1]],
-                [kdl_rot[2, 0], kdl_rot[2, 1], kdl_rot[2, 2], kdl_pos[2]],
-                [0, 0, 0, 1]
-            ])
-            T_base_cam = hom_matrix.tolist()  # JSON-serializable
-            rospy.loginfo("Successfully obtained T_base_cam from TF.")
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
-            rospy.logwarn(f"Could not obtain T_base_cam from TF: {e}. Using identity.")
-        except Exception as e:
-            rospy.logwarn(f"Unexpected TF error: {e}. Using identity.")
+        T_base_cam = self._lookup_T_base_cam()
 
-        # --- 4. Call DIFT /plan_action ----------------------------------
+        # --- 4. Call DIFT endpoint --------------------------------------
         rospy.loginfo(
-            f"Calling DIFT plan_action | prompt='{text_prompt}' task='{task}'"
+            f"[{log_tag}] Calling DIFT {dift_url} | "
+            f"prompt='{text_prompt}' task='{task}'"
         )
         dift_result, dift_err = self._call_dift(
+            dift_url,
             rgb, depth, fx, fy, cx, cy,
-            text_prompt, task, T_base_cam, current_ee_pose_base, num_req_candidates, num_req_path_waypoints
+            text_prompt, task, T_base_cam, current_ee_pose_base,
+            num_req_candidates, num_req_path_waypoints,
         )
 
         if dift_err:
@@ -321,44 +395,163 @@ class DetectKeypointsNode:
                 f"{dift_result.get('message', json.dumps(dift_result)) if isinstance(dift_result, dict) else dift_result}"
             )
 
-        # --- 5. Log the payload and forward verbatim --------------------
+        # --- 5. Serialize and dispatch ----------------------------------
         try:
+            # Plain get_keypoints: forward verbatim and return.
+            if not execute_trajectory:
+                dift_result["keypoint_prepick_pose"]["position"]["z"] = float(
+                        max(
+                        dift_result["keypoint_prepick_pose"]["position"]["z"],
+                        0.02,
+                    )
+                )
+
             payload_str = json.dumps(dift_result)
-            rospy.loginfo(f"DIFT response: {payload_str}")
-            return RobotCommandResponse(
-                result_code=ResultCode(result_code=0, message="DIFT call successful."),
-                data=payload_str,
+            rospy.loginfo(f"[{log_tag}] DIFT response: {payload_str}")
+            rospy.loginfo(
+                f"[{log_tag}] DIFT response payload received "
+                f"({len(payload_str)} bytes). Keys: {list(dift_result.keys())}"
             )
+
+            # Plain get_keypoints: forward verbatim and return.
+            if not execute_trajectory:
+                response.result_code.result_code = ResultCode.SUCCESS
+                response.result_code.message     = "DIFT call successful."
+                response.data                    = payload_str
+                return response
+
+            # Trajectory variant: dispatch to the impedance-trajectory executor.
+            return self._dispatch_trajectory(response, dift_result, payload_str, log_tag)
+        
         except (TypeError, ValueError) as e:
             return self._fail(
                 response,
                 f"DIFT response is not JSON-serializable: {e}"
             )
 
+    # ------------------------------------------------------------------ #
+    #  Trajectory dispatch                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _dispatch_trajectory(self, response, dift_result, payload_str, log_tag):
+        """
+        If the DIFT response contains a list-valued 'trajectory_base_frame',
+        forward it to /robot/control/execute_impedance_trajectory.
+        Otherwise return a FAILURE response containing the raw DIFT payload.
+        """
+        if "trajectory_base_frame" in dift_result:
+            traj = dift_result["trajectory_base_frame"]
+            if isinstance(traj, list):
+                rospy.loginfo(f"Trajectory waypoints (base frame): {len(traj)}")
+                rospy.loginfo(f"Full DIFT payload: {payload_str}")
+                # Build waypoint lists grouped by consecutive label continuations
+                stages = dift_result.get("stages", [])
+                
+                # Flatten all waypoints from all stages in order
+                all_waypoints = [
+                    {
+                        "position_base":        wp["position_base"],
+                        "quaternion_base_xyzw": wp["quaternion_base_xyzw"],
+                        "gripper_action":       wp["gripper_action"],
+                        "label":                wp["label"],
+                    }
+                    for stage in stages
+                    for wp in stage["waypoints"]
+                ]
+                
+                # Group consecutive waypoints sharing the same label
+                label_grouped_waypoints = []
+                for wp in all_waypoints:
+                    if label_grouped_waypoints and label_grouped_waypoints[-1][-1]["label"] == wp["label"]:
+                        label_grouped_waypoints[-1].append(wp)
+                    else:
+                        label_grouped_waypoints.append([wp])
+                
+                response.result_code.result_code = ResultCode.SUCCESS
+                response.result_code.message     = "Keypoint planning succeeded."
+                response.data                    = json.dumps({
+                    "status":   "success",
+                    "message":  "Keypoint planning and trajectory execution succeeded.",
+                    "waypoints": label_grouped_waypoints,
+                })
+                return response
+            else:
+                rospy.loginfo("DIFT 'trajectory_base_frame' field is not a list.")
+                response.result_code.result_code = ResultCode.FAILURE
+                response.result_code.message     = "Keypoint planning succeeded, but no valid trajectory found from ReKep Trajectory Planner."
+                response.data                    = payload_str
+                return response
+        else:
+            rospy.loginfo("No trajectory found in DIFT response.")
+            response.result_code.result_code = ResultCode.FAILURE
+            response.result_code.message     = "Keypoint planning succeeded, but no trajectory provided by ReKep Trajectory Planner."
+            response.data                    = payload_str
+            return response
+
+
+    # ------------------------------------------------------------------ #
+    #  TF lookup                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _lookup_T_base_cam(self):
+        """
+        Look up the homogeneous transform from camera_frame -> base_frame.
+
+        Returns a 4x4 Python list. Falls back to identity if the lookup fails.
+        """
+        T_base_cam = np.eye(4).tolist()
+        try:
+            import tf2_ros
+            import tf2_geometry_msgs
+            transform = self._tf_buffer.lookup_transform(
+                self.base_frame,            # target frame (robot base)
+                self.camera_frame,          # source frame (RealSense RGB camera)
+                rospy.Time(0),              # latest available
+                rospy.Duration(self.tf_timeout_sec),
+            )
+            tf_to_kdl = tf2_geometry_msgs.transform_to_kdl(transform)
+            kdl_rot = tf_to_kdl.M
+            kdl_pos = tf_to_kdl.p
+            hom_matrix = np.array([
+                [kdl_rot[0, 0], kdl_rot[0, 1], kdl_rot[0, 2], kdl_pos[0]],
+                [kdl_rot[1, 0], kdl_rot[1, 1], kdl_rot[1, 2], kdl_pos[1]],
+                [kdl_rot[2, 0], kdl_rot[2, 1], kdl_rot[2, 2], kdl_pos[2]],
+                [0, 0, 0, 1],
+            ])
+            T_base_cam = hom_matrix.tolist()  # JSON-serializable
+            rospy.loginfo("Successfully obtained T_base_cam from TF.")
+        except (tf2_ros.LookupException,
+                tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn(f"Could not obtain T_base_cam from TF: {e}. Using identity.")
+        except Exception as e:
+            rospy.logwarn(f"Unexpected TF error: {e}. Using identity.")
+        return T_base_cam
 
     # ------------------------------------------------------------------ #
     #  DIFT WebSocket call                                                 #
     # ------------------------------------------------------------------ #
 
-    def _call_dift(self, rgb, depth, fx, fy, cx, cy,
-                   text_prompt, task, T_base_cam, current_ee_pose_base, num_req_candidates=50, num_req_path_waypoints=10):
+    def _call_dift(self, dift_url, rgb, depth, fx, fy, cx, cy,
+                   text_prompt, task, T_base_cam, current_ee_pose_base,
+                   num_req_candidates=50, num_req_path_waypoints=10):
         """
-        Send RGB + depth + intrinsics + T_base_cam + task/prompt to the DIFT
-        /plan_action endpoint.
+        Send RGB + depth + intrinsics + T_base_cam + task/prompt to the
+        specified DIFT endpoint.
 
         Returns:
             tuple: (result_dict, error_string) — exactly one is None.
         """
         try:
             payload = {
-                "rgb":          self._encode_rgb(rgb),
-                "depth":        self._encode_depth(depth),
+                "rgb":                self._encode_rgb(rgb),
+                "depth":              self._encode_depth(depth),
                 "fx": fx, "fy": fy, "cx": cx, "cy": cy,
-                "depth_scale":  self.depth_scale,
-                "T_base_cam":   T_base_cam,
-                "text_prompt":  text_prompt,
-                "task":         task,
-                "num_candidates": num_req_candidates,
+                "depth_scale":        self.depth_scale,
+                "T_base_cam":         T_base_cam,
+                "text_prompt":        text_prompt,
+                "task":               task,
+                "num_candidates":     num_req_candidates,
                 "num_path_waypoints": num_req_path_waypoints,
             }
             if current_ee_pose_base is not None:
@@ -366,14 +559,14 @@ class DetectKeypointsNode:
 
             result = asyncio.run(
                 self._ws_send_recv(
-                    self.dift_url, json.dumps(payload),
+                    dift_url, json.dumps(payload),
                     self.dift_timeout_sec, max_msg_mb=50,
                 )
             )
             return result, None
 
         except aiohttp.ClientConnectorError:
-            return None, f"Could not connect to DIFT server at {self.dift_url}"
+            return None, f"Could not connect to DIFT server at {dift_url}"
         except aiohttp.WSServerHandshakeError as e:
             return None, f"DIFT WebSocket handshake failed: {e}"
         except asyncio.TimeoutError:
@@ -439,7 +632,7 @@ class DetectKeypointsNode:
         """
         Populate *response* as a failure and log the error.
         """
-        rospy.logerr(f"detect_keypoints service error: {msg}")
+        rospy.logerr(f"get_keypoints service error: {msg}")
         response.result_code.result_code = ResultCode.FAILURE
         response.result_code.message     = msg
         response.data = json.dumps({"status": "error", "message": msg})

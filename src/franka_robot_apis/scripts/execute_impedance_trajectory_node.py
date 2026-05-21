@@ -2,7 +2,7 @@
 """
 ROS1 Noetic service node: Cartesian Impedance Trajectory Executor
 ------------------------------------------------------------------
-Service: /robot/control/execute_impedance_trajectory  (robot_api_interfaces/RobotCommand)
+Service: /robot/control/execute_waypoint_trajectory  (robot_api_interfaces/RobotCommand)
 
 Loops over a list of pose waypoints (base frame). For each waypoint:
   1. Publish the target as geometry_msgs/PoseStamped on the Franka cartesian
@@ -64,9 +64,9 @@ Response JSON (in .data field):
 }
 
 Usage:
-    rosrun <your_pkg> execute_impedance_trajectory_service.py
+    rosrun <your_pkg> execute_waypoint_trajectory_service.py
 
-    rosservice call /robot/control/execute_impedance_trajectory \\
+    rosservice call /robot/control/execute_waypoint_trajectory \\
         '{"req": "{\\"waypoints\\": [ ... ]}"}'
 """
 
@@ -157,14 +157,14 @@ class TrajectoryExecutorNode:
         #  Service                                                             #
         # ------------------------------------------------------------------ #
         self._service = rospy.Service(
-            "/robot/control/execute_impedance_trajectory",
+            "/robot/control/execute_waypoint_trajectory",
             RobotCommand,
             self._handle_request,
         )
 
         rospy.loginfo(
             "\nTrajectoryExecutorNode (ROS1) ready.\n"
-            f"  Service        : /robot/control/execute_impedance_trajectory\n"
+            f"  Service        : /robot/control/execute_waypoint_trajectory\n"
             f"  Equilibrium    : {self.equilibrium_topic}\n"
             f"  Gripper svc    : {self.gripper_service}\n"
             f"  Base frame     : {self.base_frame}\n"
@@ -453,7 +453,7 @@ class TrajectoryExecutorNode:
     # ------------------------------------------------------------------ #
 
     def _handle_request(self, request):
-        rospy.loginfo(f"execute_impedance_trajectory request received ({len(request.req)} bytes)")
+        rospy.loginfo(f"execute_waypoint_trajectory request received ({len(request.req)} bytes)")
         response = RobotCommandResponse()
 
         # --- 1. Parse request -------------------------------------------
@@ -626,7 +626,7 @@ class TrajectoryExecutorNode:
         response.result_code.message     = f"Executed {len(executed)} waypoints."
         response.data                    = json.dumps(payload)
 
-        rospy.loginfo(f"execute_impedance_trajectory done: {payload['message']}")
+        rospy.loginfo(f"execute_waypoint_trajectory done: {payload['message']}")
         return response
 
     # ------------------------------------------------------------------ #
@@ -635,7 +635,7 @@ class TrajectoryExecutorNode:
 
     def _fail(self, response, msg):
         """Populate *response* as a hard failure with no partial progress."""
-        rospy.logerr(f"execute_impedance_trajectory error: {msg}")
+        rospy.logerr(f"execute_waypoint_trajectory error: {msg}")
         response.result_code.result_code = ResultCode.FAILURE
         response.result_code.message     = msg
         response.data = json.dumps({"status": "error", "message": msg})
@@ -643,7 +643,7 @@ class TrajectoryExecutorNode:
 
     def _fail_with_partial(self, response, msg, executed, t_start):
         """Populate *response* as a failure but include the per-waypoint log."""
-        rospy.logerr(f"execute_impedance_trajectory error: {msg}")
+        rospy.logerr(f"execute_waypoint_trajectory error: {msg}")
         response.result_code.result_code = ResultCode.FAILURE
         response.result_code.message     = msg
         response.data = json.dumps({
