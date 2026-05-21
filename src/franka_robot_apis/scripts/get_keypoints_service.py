@@ -14,10 +14,11 @@ This node exposes TWO services backed by the same DIFT server:
           /robot/control/execute_impedance_trajectory for execution.
 
 Both services share the same RGB-D capture, intrinsics, and TF-lookup
-pipeline.
+pipeline. The camera to use ("wrist" or "scene") is selectable per
+request via the "camera" field.
 
 Pipeline (shared):
-  1. Capture latest RGB-D + intrinsics from the RealSense
+  1. Capture latest RGB-D + intrinsics from the requested camera
   2. Look up TF (base_frame <- camera_frame) -> T_base_cam (4x4)
   3. Send RGB-D + intrinsics + T_base_cam + task/prompt to the DIFT
      WebSocket server (endpoint depends on which service was called)
@@ -28,6 +29,7 @@ Request (JSON string in .req field):
 {
     "text_prompt"          : "white cloth on table",      # SAM2 prompt
     "task"                 : "fold the cloth in half",    # natural-language task
+    "camera"               : "scene",                     # "wrist" or "scene" (default: "scene")
     "current_ee_pose_base" : [[...4x4...]]                # optional, 4x4 list
     "num_candidates"       : 50                           # optional, int (5-100)
     "num_path_waypoints"   : 20                           # optional, int (2-20)
@@ -42,10 +44,10 @@ ROS1 usage:
     rosrun franka_robot_apis detect_keypoints_service.py
 
     rosservice call /robot/perception/get_keypoints \\
-        '{"req": "{\\"text_prompt\\":\\"white cloth\\",\\"task\\":\\"fold the cloth in half\\"}"}'
+        '{"req": "{\\"text_prompt\\":\\"white cloth\\",\\"task\\":\\"fold the cloth in half\\",\\"camera\\":\\"scene\\"}"}'
 
     rosservice call /robot/perception/get_keypoints_trajectory \\
-        '{"req": "{\\"text_prompt\\":\\"white cloth\\",\\"task\\":\\"fold the cloth in half\\"}"}'
+        '{"req": "{\\"text_prompt\\":\\"white cloth\\",\\"task\\":\\"fold the cloth in half\\",\\"camera\\":\\"wrist\\"}"}'
 """
 
 import json
@@ -70,6 +72,40 @@ from robot_api_interfaces.srv import (
 from robot_api_interfaces.msg import ResultCode
 
 
+# Allowed values for the "camera" field in the request JSON.
+VALID_CAMERAS = ("wrist", "scene")
+
+
+# ---------------------------------------------------------------------------
+# Per-camera state holder
+# ---------------------------------------------------------------------------
+class CameraState:
+    """
+    Holds the latest RGB/depth frames, intrinsics, topic names, and the
+    TF frame for a single camera (e.g. "scene" or "wrist").
+    """
+
+    def __init__(self, name, rgb_topic, depth_topic, camera_info_topic,
+                 camera_frame, fx, fy, cx, cy):
+        self.name              = name
+        self.rgb_topic         = rgb_topic
+        self.depth_topic       = depth_topic
+        self.camera_info_topic = camera_info_topic
+        self.camera_frame      = camera_frame
+
+        # Fallback intrinsics — overwritten on first CameraInfo message.
+        self.fx = fx
+        self.fy = fy
+        self.cx = cx
+        self.cy = cy
+        self.camera_info_received = False
+
+        self.latest_rgb   = None   # np.ndarray uint8  (H,W,3) BGR
+        self.latest_depth = None   # np.ndarray uint16 (H,W)
+
+        self.lock = threading.Lock()
+
+
 # ---------------------------------------------------------------------------
 # Main service class
 # ---------------------------------------------------------------------------
@@ -79,18 +115,17 @@ class DetectKeypointsNode:
       - /select_keypoint  (exposed as /robot/perception/get_keypoints)
       - /plan_action      (exposed as /robot/perception/get_keypoints_trajectory)
 
-    Captures an RGB + depth frame, gathers intrinsics and T_base_cam, ships
-    everything to the DIFT server alongside the user's text_prompt + task,
-    and forwards the response to the caller. The trajectory variant also
-    forwards any returned trajectory to the impedance-trajectory executor.
+    Captures an RGB + depth frame from the requested camera ("scene" or
+    "wrist"), gathers intrinsics and T_base_cam, ships everything to the
+    DIFT server alongside the user's text_prompt + task, and forwards the
+    response to the caller.
     """
 
     def __init__(self):
         # ------------------------------------------------------------------ #
         #  Parameters                                                          #
         # ------------------------------------------------------------------ #
-        # Base WebSocket URL for the DIFT server. Endpoints are appended per
-        # service: <base>/select_keypoint and <base>/plan_action.
+        # Base WebSocket URL for the DIFT server.
         self.dift_base_url = rospy.get_param(
             "~dift_base_url", "ws://10.158.54.164:8769"
         ).rstrip("/")
@@ -105,16 +140,34 @@ class DetectKeypointsNode:
             f"{self.dift_base_url}/plan_action",
         )
 
-        # Camera topics — same RealSense serial used in detect_objects node
-        self.rgb_topic         = rospy.get_param("~rgb_topic",         "/zed/scene/color/image_raw")
-        self.depth_topic       = rospy.get_param("~depth_topic",       "/zed/scene/aligned_depth_to_color/image_raw")
-        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/zed/scene/aligned_depth_to_color/camera_info")
+        # --- Scene camera params ---
+        scene_rgb_topic   = rospy.get_param("~scene_rgb_topic",         "/zed/scene/color/image_raw")
+        scene_depth_topic = rospy.get_param("~scene_depth_topic",       "/zed/scene/aligned_depth_to_color/image_raw")
+        scene_info_topic  = rospy.get_param("~scene_camera_info_topic", "/zed/scene/aligned_depth_to_color/camera_info")
+        scene_frame       = rospy.get_param("~scene_camera_frame",      "zed_scene_left_optical_frame")
+        scene_fx = float(rospy.get_param("~scene_fx", 752.0038452148438))
+        scene_fy = float(rospy.get_param("~scene_fy", 751.7178344726562))
+        scene_cx = float(rospy.get_param("~scene_cx", 628.4379272460938))
+        scene_cy = float(rospy.get_param("~scene_cy", 335.1157531738281))
 
-        # Fallback intrinsics (used only if camera_info never arrives)
-        self.fx_default = float(rospy.get_param("~fx", 752.0038452148438))
-        self.fy_default = float(rospy.get_param("~fy", 751.7178344726562))
-        self.cx_default = float(rospy.get_param("~cx", 628.4379272460938))
-        self.cy_default = float(rospy.get_param("~cy", 335.1157531738281))
+        # --- Wrist camera params ---
+        wrist_rgb_topic   = rospy.get_param("~wrist_rgb_topic",         "/zed/wrist/color/image_raw")
+        wrist_depth_topic = rospy.get_param("~wrist_depth_topic",       "/zed/wrist/aligned_depth_to_color/image_raw")
+        wrist_info_topic  = rospy.get_param("~wrist_camera_info_topic", "/zed/wrist/aligned_depth_to_color/camera_info")
+        wrist_frame       = rospy.get_param("~wrist_camera_frame",      "zed_wrist_left_optical_frame")
+        wrist_fx = float(rospy.get_param("~wrist_fx", scene_fx))
+        wrist_fy = float(rospy.get_param("~wrist_fy", scene_fy))
+        wrist_cx = float(rospy.get_param("~wrist_cx", scene_cx))
+        wrist_cy = float(rospy.get_param("~wrist_cy", scene_cy))
+
+        # Default camera when the request does not specify one.
+        self.default_camera = rospy.get_param("~default_camera", "scene").lower()
+        if self.default_camera not in VALID_CAMERAS:
+            rospy.logwarn(
+                f"~default_camera='{self.default_camera}' is invalid; "
+                f"falling back to 'scene'. Valid options: {VALID_CAMERAS}"
+            )
+            self.default_camera = "scene"
 
         # Depth scale — RealSense default is 0.001 (mm -> m)
         self.depth_scale = float(rospy.get_param("~depth_scale", 0.001))
@@ -123,45 +176,60 @@ class DetectKeypointsNode:
         self.camera_wait_sec  = float(rospy.get_param("~camera_wait_sec",  1.0))
         self.dift_timeout_sec = float(rospy.get_param("~dift_timeout_sec", 60.0))
 
-        # TF parameters
-        self.camera_frame   = rospy.get_param("~camera_frame", "zed_scene_left_optical_frame")
+        # TF parameters (base_frame is shared; per-camera frame lives on CameraState).
         self.base_frame     = rospy.get_param("~base_frame",   "panda_link0")
         self.tf_timeout_sec = float(rospy.get_param("~tf_timeout_sec", 2.0))
 
         # ------------------------------------------------------------------ #
-        #  Camera state                                                        #
+        #  Camera state — one CameraState object per camera                    #
         # ------------------------------------------------------------------ #
-        self.latest_rgb           = None   # np.ndarray uint8  (H,W,3) BGR
-        self.latest_depth         = None   # np.ndarray uint16 (H,W)
-        self.fx                   = self.fx_default
-        self.fy                   = self.fy_default
-        self.cx                   = self.cx_default
-        self.cy                   = self.cy_default
-        self.camera_info_received = False
-        self._cam_lock            = threading.Lock()
+        self.cameras = {
+            "scene": CameraState(
+                name="scene",
+                rgb_topic=scene_rgb_topic,
+                depth_topic=scene_depth_topic,
+                camera_info_topic=scene_info_topic,
+                camera_frame=scene_frame,
+                fx=scene_fx, fy=scene_fy, cx=scene_cx, cy=scene_cy,
+            ),
+            "wrist": CameraState(
+                name="wrist",
+                rgb_topic=wrist_rgb_topic,
+                depth_topic=wrist_depth_topic,
+                camera_info_topic=wrist_info_topic,
+                camera_frame=wrist_frame,
+                fx=wrist_fx, fy=wrist_fy, cx=wrist_cx, cy=wrist_cy,
+            ),
+        }
 
         # ------------------------------------------------------------------ #
         #  TF buffer (set up once, reused for every request)                   #
         # ------------------------------------------------------------------ #
-        import tf2_ros  # imported here so module-level import errors don't break param parsing
+        import tf2_ros
+        self._tf2_ros     = tf2_ros
         self._tf_buffer   = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer)
 
         # ------------------------------------------------------------------ #
-        #  Subscriptions                                                       #
+        #  Subscriptions — one set per camera                                  #
         # ------------------------------------------------------------------ #
-        rospy.Subscriber(
-            self.rgb_topic, Image, self._rgb_cb,
-            queue_size=1, buff_size=2 ** 24,   # 16 MB — fits HD colour frames
-        )
-        rospy.Subscriber(
-            self.depth_topic, Image, self._depth_cb,
-            queue_size=1, buff_size=2 ** 24,
-        )
-        rospy.Subscriber(
-            self.camera_info_topic, CameraInfo, self._camera_info_cb,
-            queue_size=10,
-        )
+        self._subs = []
+        for cam in self.cameras.values():
+            self._subs.append(rospy.Subscriber(
+                cam.rgb_topic, Image,
+                lambda msg, _cam=cam: self._rgb_cb(msg, _cam),
+                queue_size=1, buff_size=2 ** 24,   # 16 MB — fits HD colour frames
+            ))
+            self._subs.append(rospy.Subscriber(
+                cam.depth_topic, Image,
+                lambda msg, _cam=cam: self._depth_cb(msg, _cam),
+                queue_size=1, buff_size=2 ** 24,
+            ))
+            self._subs.append(rospy.Subscriber(
+                cam.camera_info_topic, CameraInfo,
+                lambda msg, _cam=cam: self._camera_info_cb(msg, _cam),
+                queue_size=10,
+            ))
 
         # ------------------------------------------------------------------ #
         #  Services                                                            #
@@ -177,26 +245,32 @@ class DetectKeypointsNode:
             self._handle_get_keypoints_trajectory,
         )
 
-
         rospy.loginfo(
             "\nDetectKeypointsNode (ROS1) ready.\n"
             f"  Service (keypoints)         : /robot/perception/get_keypoints\n"
             f"  Service (keypoints+traj)    : /robot/perception/get_keypoints_trajectory\n"
             f"  DIFT /select_keypoint       : {self.dift_select_keypoint_url}\n"
             f"  DIFT /plan_action           : {self.dift_plan_action_url}\n"
-            f"  RGB                         : {self.rgb_topic}\n"
-            f"  Depth                       : {self.depth_topic}\n"
-            f"  CamInfo                     : {self.camera_info_topic}\n"
-            f"  Camera frame                : {self.camera_frame}\n"
+            f"  Default camera              : {self.default_camera}\n"
             f"  Base frame                  : {self.base_frame}\n"
             f"  DepthScale                  : {self.depth_scale}\n"
+            f"  --- scene ---\n"
+            f"  RGB                         : {self.cameras['scene'].rgb_topic}\n"
+            f"  Depth                       : {self.cameras['scene'].depth_topic}\n"
+            f"  CamInfo                     : {self.cameras['scene'].camera_info_topic}\n"
+            f"  Frame                       : {self.cameras['scene'].camera_frame}\n"
+            f"  --- wrist ---\n"
+            f"  RGB                         : {self.cameras['wrist'].rgb_topic}\n"
+            f"  Depth                       : {self.cameras['wrist'].depth_topic}\n"
+            f"  CamInfo                     : {self.cameras['wrist'].camera_info_topic}\n"
+            f"  Frame                       : {self.cameras['wrist'].camera_frame}"
         )
 
     # ------------------------------------------------------------------ #
     #  Camera callbacks — ros_numpy replaces CvBridge                     #
     # ------------------------------------------------------------------ #
 
-    def _rgb_cb(self, msg):
+    def _rgb_cb(self, msg, cam):
         """
         Convert sensor_msgs/Image -> BGR uint8 numpy array using ros_numpy.
         """
@@ -210,12 +284,12 @@ class DetectKeypointsNode:
             elif enc == "bgra8":
                 img = img[..., :3].copy()                    # drop alpha, BGR
             # bgr8 / mono encodings: use as-is
-            with self._cam_lock:
-                self.latest_rgb = img
+            with cam.lock:
+                cam.latest_rgb = img
         except Exception as e:
-            rospy.logwarn(f"RGB decode error: {e}")
+            rospy.logwarn(f"[{cam.name}] RGB decode error: {e}")
 
-    def _depth_cb(self, msg):
+    def _depth_cb(self, msg, cam):
         """
         Convert sensor_msgs/Image -> uint16 numpy array using ros_numpy.
         """
@@ -223,27 +297,27 @@ class DetectKeypointsNode:
             img = ros_numpy.numpify(msg)
             if img.dtype != np.uint16:
                 img = img.astype(np.uint16)
-            with self._cam_lock:
-                self.latest_depth = img
+            with cam.lock:
+                cam.latest_depth = img
         except Exception as e:
-            rospy.logwarn(f"Depth decode error: {e}")
+            rospy.logwarn(f"[{cam.name}] Depth decode error: {e}")
 
-    def _camera_info_cb(self, msg):
+    def _camera_info_cb(self, msg, cam):
         """
         Cache camera intrinsics on first receipt.
         K = [fx, 0, cx, 0, fy, cy, 0, 0, 1]
         """
-        with self._cam_lock:
-            if not self.camera_info_received:
-                self.fx = float(msg.K[0])
-                self.fy = float(msg.K[4])
-                self.cx = float(msg.K[2])
-                self.cy = float(msg.K[5])
-                self.camera_info_received = True
+        with cam.lock:
+            if not cam.camera_info_received:
+                cam.fx = float(msg.K[0])
+                cam.fy = float(msg.K[4])
+                cam.cx = float(msg.K[2])
+                cam.cy = float(msg.K[5])
+                cam.camera_info_received = True
                 rospy.loginfo(
-                    f"Camera intrinsics received: "
-                    f"fx={self.fx:.2f} fy={self.fy:.2f} "
-                    f"cx={self.cx:.2f} cy={self.cy:.2f}"
+                    f"[{cam.name}] Camera intrinsics received: "
+                    f"fx={cam.fx:.2f} fy={cam.fy:.2f} "
+                    f"cx={cam.cx:.2f} cy={cam.cy:.2f}"
                 )
 
     # ------------------------------------------------------------------ #
@@ -286,9 +360,9 @@ class DetectKeypointsNode:
         """
         Shared request-handling pipeline:
 
-          1. Parse + validate request JSON.
-          2. Wait for a fresh RGB-D frame.
-          3. Look up T_base_cam from TF.
+          1. Parse + validate request JSON (including camera selection).
+          2. Wait for a fresh RGB-D frame from the selected camera.
+          3. Look up T_base_cam from TF for that camera.
           4. Call the appropriate DIFT endpoint.
           5. Either forward the response verbatim (get_keypoints) or
              dispatch the returned trajectory to the impedance-trajectory
@@ -307,6 +381,27 @@ class DetectKeypointsNode:
         task        = (req_data.get("task")        or "").strip()
         if not task:
             return self._fail(response, "Missing required field 'task' (non-empty string).")
+
+        # --- 1a. Resolve which camera to use ----------------------------
+        camera = req_data.get("camera", self.default_camera)
+        if not isinstance(camera, str):
+            return self._fail(
+                response,
+                f"'camera' must be a string, got {type(camera).__name__}.",
+            )
+        camera = camera.strip().lower()
+        if camera not in self.cameras:
+            return self._fail(
+                response,
+                f"Invalid 'camera' value: '{camera}'. "
+                f"Must be one of: {list(self.cameras.keys())}.",
+            )
+        cam = self.cameras[camera]
+
+        rospy.loginfo(
+            f"[{log_tag}] Using camera='{cam.name}' | rgb='{cam.rgb_topic}' "
+            f"frame='{cam.camera_frame}'"
+        )
 
         # Optional: client may specify number of candidates and path waypoints
         num_req_candidates = req_data.get("num_candidates", 50)
@@ -341,13 +436,15 @@ class DetectKeypointsNode:
                 )
 
         # --- 2. Wait for camera frames ----------------------------------
-        rospy.loginfo(f"[{log_tag}] Waiting up to {self.camera_wait_sec}s for camera frames ...")
+        rospy.loginfo(
+            f"[{log_tag}] Waiting up to {self.camera_wait_sec}s for {cam.name} camera frames ..."
+        )
         deadline   = time.time() + self.camera_wait_sec
         has_frames = False
         while time.time() < deadline:
-            with self._cam_lock:
-                has_frames = (self.latest_rgb is not None and
-                              self.latest_depth is not None)
+            with cam.lock:
+                has_frames = (cam.latest_rgb is not None and
+                              cam.latest_depth is not None)
             if has_frames:
                 break
             time.sleep(0.05)
@@ -355,28 +452,29 @@ class DetectKeypointsNode:
         if not has_frames:
             return self._fail(
                 response,
-                f"Timed out waiting for camera frames on "
-                f"'{self.rgb_topic}' / '{self.depth_topic}'."
+                f"Timed out waiting for {cam.name} camera frames on "
+                f"'{cam.rgb_topic}' / '{cam.depth_topic}'."
             )
 
-        with self._cam_lock:
-            rgb            = self.latest_rgb.copy()
-            depth          = self.latest_depth.copy()
-            fx, fy, cx, cy = self.fx, self.fy, self.cx, self.cy
+        with cam.lock:
+            rgb            = cam.latest_rgb.copy()
+            depth          = cam.latest_depth.copy()
+            fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
+            cam_info_ok    = cam.camera_info_received
 
-        if not self.camera_info_received:
+        if not cam_info_ok:
             rospy.logwarn(
-                "CameraInfo not yet received — using fallback intrinsics. "
+                f"[{cam.name}] CameraInfo not yet received — using fallback intrinsics. "
                 f"fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}"
             )
 
         # --- 3. Get T_base_cam from TF (camera frame -> robot base frame)
-        T_base_cam = self._lookup_T_base_cam()
+        T_base_cam = self._lookup_T_base_cam(cam.camera_frame)
 
         # --- 4. Call DIFT endpoint --------------------------------------
         rospy.loginfo(
             f"[{log_tag}] Calling DIFT {dift_url} | "
-            f"prompt='{text_prompt}' task='{task}'"
+            f"camera='{cam.name}' prompt='{text_prompt}' task='{task}'"
         )
         dift_result, dift_err = self._call_dift(
             dift_url,
@@ -406,6 +504,9 @@ class DetectKeypointsNode:
                     )
                 )
 
+            # Echo which camera was used so callers can confirm.
+            dift_result["camera"] = cam.name
+
             payload_str = json.dumps(dift_result)
             rospy.loginfo(f"[{log_tag}] DIFT response: {payload_str}")
             rospy.loginfo(
@@ -421,8 +522,8 @@ class DetectKeypointsNode:
                 return response
 
             # Trajectory variant: dispatch to the impedance-trajectory executor.
-            return self._dispatch_trajectory(response, dift_result, payload_str, log_tag)
-        
+            return self._dispatch_trajectory(response, dift_result, payload_str, log_tag, cam.name)
+
         except (TypeError, ValueError) as e:
             return self._fail(
                 response,
@@ -433,7 +534,7 @@ class DetectKeypointsNode:
     #  Trajectory dispatch                                                 #
     # ------------------------------------------------------------------ #
 
-    def _dispatch_trajectory(self, response, dift_result, payload_str, log_tag):
+    def _dispatch_trajectory(self, response, dift_result, payload_str, log_tag, camera_name):
         """
         If the DIFT response contains a list-valued 'trajectory_base_frame',
         forward it to /robot/control/execute_impedance_trajectory.
@@ -446,7 +547,7 @@ class DetectKeypointsNode:
                 rospy.loginfo(f"Full DIFT payload: {payload_str}")
                 # Build waypoint lists grouped by consecutive label continuations
                 stages = dift_result.get("stages", [])
-                
+
                 # Flatten all waypoints from all stages in order
                 all_waypoints = [
                     {
@@ -458,7 +559,7 @@ class DetectKeypointsNode:
                     for stage in stages
                     for wp in stage["waypoints"]
                 ]
-                
+
                 # Group consecutive waypoints sharing the same label
                 label_grouped_waypoints = []
                 for wp in all_waypoints:
@@ -466,12 +567,13 @@ class DetectKeypointsNode:
                         label_grouped_waypoints[-1].append(wp)
                     else:
                         label_grouped_waypoints.append([wp])
-                
+
                 response.result_code.result_code = ResultCode.SUCCESS
                 response.result_code.message     = "Keypoint planning succeeded."
                 response.data                    = json.dumps({
-                    "status":   "success",
-                    "message":  "Keypoint planning and trajectory execution succeeded.",
+                    "status":    "success",
+                    "message":   "Keypoint planning and trajectory execution succeeded.",
+                    "camera":    camera_name,
                     "waypoints": label_grouped_waypoints,
                 })
                 return response
@@ -488,12 +590,11 @@ class DetectKeypointsNode:
             response.data                    = payload_str
             return response
 
-
     # ------------------------------------------------------------------ #
     #  TF lookup                                                           #
     # ------------------------------------------------------------------ #
 
-    def _lookup_T_base_cam(self):
+    def _lookup_T_base_cam(self, camera_frame):
         """
         Look up the homogeneous transform from camera_frame -> base_frame.
 
@@ -501,11 +602,10 @@ class DetectKeypointsNode:
         """
         T_base_cam = np.eye(4).tolist()
         try:
-            import tf2_ros
             import tf2_geometry_msgs
             transform = self._tf_buffer.lookup_transform(
                 self.base_frame,            # target frame (robot base)
-                self.camera_frame,          # source frame (RealSense RGB camera)
+                camera_frame,               # source frame (this camera)
                 rospy.Time(0),              # latest available
                 rospy.Duration(self.tf_timeout_sec),
             )
@@ -519,11 +619,16 @@ class DetectKeypointsNode:
                 [0, 0, 0, 1],
             ])
             T_base_cam = hom_matrix.tolist()  # JSON-serializable
-            rospy.loginfo("Successfully obtained T_base_cam from TF.")
-        except (tf2_ros.LookupException,
-                tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException) as e:
-            rospy.logwarn(f"Could not obtain T_base_cam from TF: {e}. Using identity.")
+            rospy.loginfo(
+                f"Got T_base_cam ({camera_frame} -> {self.base_frame})."
+            )
+        except (self._tf2_ros.LookupException,
+                self._tf2_ros.ConnectivityException,
+                self._tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn(
+                f"Could not obtain T_base_cam ({camera_frame} -> "
+                f"{self.base_frame}): {e}. Using identity."
+            )
         except Exception as e:
             rospy.logwarn(f"Unexpected TF error: {e}. Using identity.")
         return T_base_cam

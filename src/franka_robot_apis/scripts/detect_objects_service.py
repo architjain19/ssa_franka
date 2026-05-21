@@ -7,7 +7,8 @@ Service: /robot/perception/detect_objects  (robot_api_interfaces/RobotCommand)
 
 Request (JSON string in .req field):
 {
-    "text_prompt": "glass"
+    "text_prompt": "glass",
+    "camera": "scene"        # "wrist" or "scene" (default: "scene")
 }
 
 Response (JSON string in .data field):
@@ -18,14 +19,20 @@ Response (JSON string in .data field):
         "quaternion_wrt_base": {"x": ..., "y": ..., "z": ..., "w": ...},
         "score": 0.2,
         "width": 0.047
-    }
+    },
+    "camera": "scene"
 }
 
 ROS1 usage:
     rosrun <your_pkg> detect_objects_service_node_ros1.py
 
+    # Scene camera (default)
     rosservice call /robot/perception/detect_objects \
-        '{"req": "{\"text_prompt\": \"floor\"}"}'
+        '{"req": "{\"text_prompt\": \"floor\", \"camera\": \"scene\"}"}'
+
+    # Wrist camera
+    rosservice call /robot/perception/detect_objects \
+        '{"req": "{\"text_prompt\": \"cup\", \"camera\": \"wrist\"}"}'
 """
 
 import json
@@ -51,18 +58,16 @@ from robot_api_interfaces.srv import RobotCommand, RobotCommandResponse
 from robot_api_interfaces.msg import ResultCode
 
 
+# Allowed values for the "camera" field in the request JSON.
+VALID_CAMERAS = ("wrist", "scene")
+
+
 # ---------------------------------------------------------------------------
 # Helper: rotquaternion (Shepperd)
 # ---------------------------------------------------------------------------
 def _rotation_matrix_to_quaternion(R):
     """
     Convert a 3x3 rotation matrix to a quaternion dict {x, y, z, w}.
-
-    Args:
-        R (list | np.ndarray): 3x3 rotation matrix
-
-    Returns:
-        dict: {"x": float, "y": float, "z": float, "w": float}
     """
     R = np.array(R, dtype=np.float64)
     trace = R[0, 0] + R[1, 1] + R[2, 2]
@@ -99,13 +104,6 @@ def _rotation_matrix_to_quaternion(R):
 def _quaternion_multiply(q_a, q_b):
     """
     Hamilton product of two quaternion dicts {x, y, z, w}.
-
-    Args:
-        q_a (dict): first quaternion
-        q_b (dict): second quaternion
-
-    Returns:
-        dict: composed quaternion
     """
     ax, ay, az, aw = q_a["x"], q_a["y"], q_a["z"], q_a["w"]
     bx, by, bz, bw = q_b["x"], q_b["y"], q_b["z"], q_b["w"]
@@ -118,6 +116,36 @@ def _quaternion_multiply(q_a, q_b):
 
 
 # ---------------------------------------------------------------------------
+# Per-camera state holder
+# ---------------------------------------------------------------------------
+class CameraState:
+    """
+    Holds the latest RGB/depth frames, intrinsics, topic names, and the
+    TF frame for a single camera (e.g. "scene" or "wrist").
+    """
+
+    def __init__(self, name, rgb_topic, depth_topic, camera_info_topic,
+                 camera_frame, fx, fy, cx, cy):
+        self.name              = name
+        self.rgb_topic         = rgb_topic
+        self.depth_topic       = depth_topic
+        self.camera_info_topic = camera_info_topic
+        self.camera_frame      = camera_frame
+
+        # Fallback intrinsics — overwritten on first CameraInfo message.
+        self.fx = fx
+        self.fy = fy
+        self.cx = cx
+        self.cy = cy
+        self.camera_info_received = False
+
+        self.latest_rgb   = None
+        self.latest_depth = None
+
+        self.lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
 # Main service class
 # ---------------------------------------------------------------------------
 class SegmentAndGraspNode:
@@ -126,71 +154,104 @@ class SegmentAndGraspNode:
       1. Grounded SAM segments the object and writes NPZ
       2. AnyGrasp Web reads NPZ, returns best grasp pose
       3. TF transform converts grasp pose from camera frame to panda_link0
+
+    The camera ("wrist" or "scene") is selectable per request via the
+    "camera" field in the request JSON.
     """
 
     def __init__(self):
         # ------------------------------------------------------------------ #
-        #  Parameters  (declare rospy.get_param with ~).                     #
+        #  Parameters                                                          #
         # ------------------------------------------------------------------ #
         self.sam2_url      = rospy.get_param("~sam2_url",     "ws://10.158.54.164:8766/detect_objects")
         self.anygrasp_url  = rospy.get_param("~anygrasp_url", "ws://10.158.54.164:8767/get_saved_grasp")
 
-        # Camera topics — updated to the robot's actual RealSense topics
-        self.rgb_topic         = rospy.get_param("~rgb_topic",         "/zed/scene/color/image_raw")
-        self.depth_topic       = rospy.get_param("~depth_topic",       "/zed/scene/aligned_depth_to_color/image_raw")
-        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/zed/scene/aligned_depth_to_color/camera_info")
+        # --- Scene camera params ---
+        scene_rgb_topic   = rospy.get_param("~scene_rgb_topic",         "/zed/scene/color/image_raw")
+        scene_depth_topic = rospy.get_param("~scene_depth_topic",       "/zed/scene/aligned_depth_to_color/image_raw")
+        scene_info_topic  = rospy.get_param("~scene_camera_info_topic", "/zed/scene/aligned_depth_to_color/camera_info")
+        scene_frame       = rospy.get_param("~scene_camera_frame",      "zed_scene_left_optical_frame")
+        scene_fx = float(rospy.get_param("~scene_fx", 752.0038452148438))
+        scene_fy = float(rospy.get_param("~scene_fy", 751.7178344726562))
+        scene_cx = float(rospy.get_param("~scene_cx", 628.4379272460938))
+        scene_cy = float(rospy.get_param("~scene_cy", 335.1157531738281))
 
-        # Fallback intrinsics (used only if camera_info never arrives)
-        self.fx_default = float(rospy.get_param("~fx", 752.0038452148438))
-        self.fy_default = float(rospy.get_param("~fy", 751.7178344726562))
-        self.cx_default = float(rospy.get_param("~cx", 628.4379272460938))
-        self.cy_default = float(rospy.get_param("~cy", 335.1157531738281))
+        # --- Wrist camera params ---
+        wrist_rgb_topic   = rospy.get_param("~wrist_rgb_topic",         "/zed/wrist/color/image_raw")
+        wrist_depth_topic = rospy.get_param("~wrist_depth_topic",       "/zed/wrist/aligned_depth_to_color/image_raw")
+        wrist_info_topic  = rospy.get_param("~wrist_camera_info_topic", "/zed/wrist/aligned_depth_to_color/camera_info")
+        wrist_frame       = rospy.get_param("~wrist_camera_frame",      "zed_wrist_left_optical_frame")
+        wrist_fx = float(rospy.get_param("~wrist_fx", scene_fx))
+        wrist_fy = float(rospy.get_param("~wrist_fy", scene_fy))
+        wrist_cx = float(rospy.get_param("~wrist_cx", scene_cx))
+        wrist_cy = float(rospy.get_param("~wrist_cy", scene_cy))
+
+        # Default camera when the request does not specify one.
+        self.default_camera = rospy.get_param("~default_camera", "scene").lower()
+        if self.default_camera not in VALID_CAMERAS:
+            rospy.logwarn(
+                f"~default_camera='{self.default_camera}' is invalid; "
+                f"falling back to 'scene'. Valid options: {VALID_CAMERAS}"
+            )
+            self.default_camera = "scene"
 
         # Timeouts
         self.camera_wait_sec   = float(rospy.get_param("~camera_wait_sec",   1.0))
         self.sam2_timeout_sec  = float(rospy.get_param("~sam2_timeout_sec",  15.0))
         self.grasp_timeout_sec = float(rospy.get_param("~grasp_timeout_sec", 15.0))
 
-        # TF parameters
-        self.camera_frame  = rospy.get_param("~camera_frame",   "zed_scene_left_optical_frame")
-        self.base_frame    = rospy.get_param("~base_frame",     "panda_link0")
-        self.tf_timeout_sec= float(rospy.get_param("~tf_timeout_sec", 2.0))
+        # TF parameters (base_frame is shared; per-camera frame lives on CameraState).
+        self.base_frame     = rospy.get_param("~base_frame",     "panda_link0")
+        self.tf_timeout_sec = float(rospy.get_param("~tf_timeout_sec", 2.0))
 
         # ------------------------------------------------------------------ #
-        #  Camera state                                                        #
+        #  Camera state — one CameraState object per camera                    #
         # ------------------------------------------------------------------ #
-        self.latest_rgb           = None   # np.ndarray uint8  (H,W,3) BGR
-        self.latest_depth         = None   # np.ndarray uint16 (H,W)
-        self.fx                   = self.fx_default
-        self.fy                   = self.fy_default
-        self.cx                   = self.cx_default
-        self.cy                   = self.cy_default
-        self.camera_info_received = False
-        self._cam_lock            = threading.Lock()
+        self.cameras = {
+            "scene": CameraState(
+                name="scene",
+                rgb_topic=scene_rgb_topic,
+                depth_topic=scene_depth_topic,
+                camera_info_topic=scene_info_topic,
+                camera_frame=scene_frame,
+                fx=scene_fx, fy=scene_fy, cx=scene_cx, cy=scene_cy,
+            ),
+            "wrist": CameraState(
+                name="wrist",
+                rgb_topic=wrist_rgb_topic,
+                depth_topic=wrist_depth_topic,
+                camera_info_topic=wrist_info_topic,
+                camera_frame=wrist_frame,
+                fx=wrist_fx, fy=wrist_fy, cx=wrist_cx, cy=wrist_cy,
+            ),
+        }
 
         # ------------------------------------------------------------------ #
-        #  TF listener  (ros1 tf.TransformListener)                          #
+        #  TF listener / broadcaster                                           #
         # ------------------------------------------------------------------ #
-        self._tf_listener = tf.TransformListener()
-        # TF broadcaster for shifted grasp pose
+        self._tf_listener    = tf.TransformListener()
         self._tf_broadcaster = tf.TransformBroadcaster()
 
         # ------------------------------------------------------------------ #
-        #  Subscriptions                                                       #
+        #  Subscriptions — one set per camera                                  #
         # ------------------------------------------------------------------ #
-        rospy.Subscriber(
-            self.rgb_topic, Image, self._rgb_cb,
-            queue_size=1, buff_size=2 ** 24,
-        )
-        rospy.Subscriber(
-            self.depth_topic, Image, self._depth_cb,
-            queue_size=1, buff_size=2 ** 24,
-        )
-        # CameraInfo is typically latched — reliable, small message
-        rospy.Subscriber(
-            self.camera_info_topic, CameraInfo, self._camera_info_cb,
-            queue_size=10,
-        )
+        self._subs = []
+        for cam in self.cameras.values():
+            self._subs.append(rospy.Subscriber(
+                cam.rgb_topic, Image,
+                lambda msg, _cam=cam: self._rgb_cb(msg, _cam),
+                queue_size=1, buff_size=2 ** 24,
+            ))
+            self._subs.append(rospy.Subscriber(
+                cam.depth_topic, Image,
+                lambda msg, _cam=cam: self._depth_cb(msg, _cam),
+                queue_size=1, buff_size=2 ** 24,
+            ))
+            self._subs.append(rospy.Subscriber(
+                cam.camera_info_topic, CameraInfo,
+                lambda msg, _cam=cam: self._camera_info_cb(msg, _cam),
+                queue_size=10,
+            ))
 
         # ------------------------------------------------------------------ #
         #  Service                                                             #
@@ -203,63 +264,65 @@ class SegmentAndGraspNode:
 
         rospy.loginfo(
             "\nSegmentAndGraspNode (ROS1) ready.\n"
-            f"  Service     : /robot/perception/detect_objects\n"
-            f"  SAM2        : {self.sam2_url}\n"
-            f"  AnyGrasp    : {self.anygrasp_url}\n"
-            f"  RGB         : {self.rgb_topic}\n"
-            f"  Depth       : {self.depth_topic}\n"
-            f"  CamInfo     : {self.camera_info_topic}\n"
-            f"  Camera frame: {self.camera_frame}\n"
-            f"  Base frame  : {self.base_frame}"
+            f"  Service        : /robot/perception/detect_objects\n"
+            f"  SAM2           : {self.sam2_url}\n"
+            f"  AnyGrasp       : {self.anygrasp_url}\n"
+            f"  Default camera : {self.default_camera}\n"
+            f"  Base frame     : {self.base_frame}\n"
+            f"  --- scene ---\n"
+            f"  RGB            : {self.cameras['scene'].rgb_topic}\n"
+            f"  Depth          : {self.cameras['scene'].depth_topic}\n"
+            f"  CamInfo        : {self.cameras['scene'].camera_info_topic}\n"
+            f"  Frame          : {self.cameras['scene'].camera_frame}\n"
+            f"  --- wrist ---\n"
+            f"  RGB            : {self.cameras['wrist'].rgb_topic}\n"
+            f"  Depth          : {self.cameras['wrist'].depth_topic}\n"
+            f"  CamInfo        : {self.cameras['wrist'].camera_info_topic}\n"
+            f"  Frame          : {self.cameras['wrist'].camera_frame}"
         )
 
     # ------------------------------------------------------------------ #
     #  Camera callbacks                                                    #
     # ------------------------------------------------------------------ #
 
-    def _rgb_cb(self, msg):
+    def _rgb_cb(self, msg, cam):
         try:
-            # ros_numpy.numpify returns (H,W,3) uint8 in RGB order for rgb8,
-            # BGR for bgr8.  Converting to BGR for OpenCV downstream.
-            img = ros_numpy.numpify(msg)          # (H,W,3) or (H,W,4) uint8
+            img = ros_numpy.numpify(msg)
             enc = msg.encoding.lower()
             if enc in ("rgb8",):
-                img = img[..., ::-1].copy()       # RGB -> BGR
+                img = img[..., ::-1].copy()
             elif enc in ("rgba8",):
-                img = img[..., :3][..., ::-1].copy()   # RGBA -> BGR
+                img = img[..., :3][..., ::-1].copy()
             elif enc in ("bgra8",):
-                img = img[..., :3].copy()         # drop alpha, already BGR
+                img = img[..., :3].copy()
             # bgr8 -> already correct; mono8/16 -> grayscale, left as-is
-            with self._cam_lock:
-                self.latest_rgb = img
+            with cam.lock:
+                cam.latest_rgb = img
         except Exception as e:
-            rospy.logwarn(f"RGB decode error: {e}")
+            rospy.logwarn(f"[{cam.name}] RGB decode error: {e}")
 
-    def _depth_cb(self, msg):
+    def _depth_cb(self, msg, cam):
         try:
-            # ros_numpy.numpify returns (H,W) for mono16 / 16UC1 depth images.
-            # Values are raw millimetres as uint16 — exactly what we need.
-            img = ros_numpy.numpify(msg)          # (H,W) typically uint16
+            img = ros_numpy.numpify(msg)
             if img.dtype != np.uint16:
                 img = img.astype(np.uint16)
-            with self._cam_lock:
-                self.latest_depth = img
+            with cam.lock:
+                cam.latest_depth = img
         except Exception as e:
-            rospy.logwarn(f"Depth decode error: {e}")
+            rospy.logwarn(f"[{cam.name}] Depth decode error: {e}")
 
-    def _camera_info_cb(self, msg):
-        # K = [fx, 0, cx, 0, fy, cy, 0, 0, 1]
-        with self._cam_lock:
-            if not self.camera_info_received:
-                self.fx = float(msg.K[0])
-                self.fy = float(msg.K[4])
-                self.cx = float(msg.K[2])
-                self.cy = float(msg.K[5])
-                self.camera_info_received = True
+    def _camera_info_cb(self, msg, cam):
+        with cam.lock:
+            if not cam.camera_info_received:
+                cam.fx = float(msg.K[0])
+                cam.fy = float(msg.K[4])
+                cam.cx = float(msg.K[2])
+                cam.cy = float(msg.K[5])
+                cam.camera_info_received = True
                 rospy.loginfo(
-                    f"Camera intrinsics received: "
-                    f"fx={self.fx:.2f} fy={self.fy:.2f} "
-                    f"cx={self.cx:.2f} cy={self.cy:.2f}"
+                    f"[{cam.name}] Camera intrinsics received: "
+                    f"fx={cam.fx:.2f} fy={cam.fy:.2f} "
+                    f"cx={cam.cx:.2f} cy={cam.cy:.2f}"
                 )
 
     # ------------------------------------------------------------------ #
@@ -269,12 +332,6 @@ class SegmentAndGraspNode:
     def _handle_request(self, request):
         """
         rospy.Service callback — called in a dedicated thread per request.
-
-        Args:
-            request (RobotCommand.Request): .req holds the JSON string
-
-        Returns:
-            RobotCommandResponse
         """
         rospy.loginfo(f"Service request received: {request.req}")
         response = RobotCommandResponse()
@@ -283,20 +340,43 @@ class SegmentAndGraspNode:
         try:
             req_data    = json.loads(request.req)
             text_prompt = req_data.get("text_prompt", "").strip() or "object"
-            x_offset   = float(req_data.get("x_offset", 0.0))
-            y_offset   = float(req_data.get("y_offset", 0.0))
-            z_offset   = float(req_data.get("z_offset", 0.0))
+            x_offset    = float(req_data.get("x_offset", 0.0))
+            y_offset    = float(req_data.get("y_offset", 0.0))
+            z_offset    = float(req_data.get("z_offset", 0.0))
         except (json.JSONDecodeError, ValueError) as e:
             return self._fail(response, f"Bad request: {e}")
 
+        # --- 1a. Resolve which camera to use ----------------------------
+        camera = req_data.get("camera", self.default_camera)
+        if not isinstance(camera, str):
+            return self._fail(
+                response,
+                f"'camera' must be a string, got {type(camera).__name__}.",
+            )
+        camera = camera.strip().lower()
+        if camera not in self.cameras:
+            return self._fail(
+                response,
+                f"Invalid 'camera' value: '{camera}'. "
+                f"Must be one of: {list(self.cameras.keys())}.",
+            )
+        cam = self.cameras[camera]
+
+        rospy.loginfo(
+            f"Using camera='{cam.name}' | rgb='{cam.rgb_topic}' "
+            f"depth='{cam.depth_topic}' frame='{cam.camera_frame}'"
+        )
+
         # --- 2. Wait for camera frames ----------------------------------
-        rospy.loginfo(f"Waiting up to {self.camera_wait_sec}s for camera frames ...")
+        rospy.loginfo(
+            f"Waiting up to {self.camera_wait_sec}s for {cam.name} camera frames ..."
+        )
         deadline = time.time() + self.camera_wait_sec
         has_frames = False
         while time.time() < deadline:
-            with self._cam_lock:
-                has_frames = (self.latest_rgb is not None and
-                              self.latest_depth is not None)
+            with cam.lock:
+                has_frames = (cam.latest_rgb is not None and
+                              cam.latest_depth is not None)
             if has_frames:
                 break
             time.sleep(0.05)
@@ -304,25 +384,26 @@ class SegmentAndGraspNode:
         if not has_frames:
             return self._fail(
                 response,
-                f"Timed out waiting for camera frames on "
-                f"'{self.rgb_topic}' / '{self.depth_topic}'."
+                f"Timed out waiting for {cam.name} camera frames on "
+                f"'{cam.rgb_topic}' / '{cam.depth_topic}'."
             )
 
-        with self._cam_lock:
-            rgb   = self.latest_rgb.copy()
-            depth = self.latest_depth.copy()
-            fx, fy, cx, cy = self.fx, self.fy, self.cx, self.cy
+        with cam.lock:
+            rgb   = cam.latest_rgb.copy()
+            depth = cam.latest_depth.copy()
+            fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
+            cam_info_ok    = cam.camera_info_received
 
-        if not self.camera_info_received:
+        if not cam_info_ok:
             rospy.logwarn(
-                "CameraInfo not yet received — using fallback intrinsics. "
+                f"[{cam.name}] CameraInfo not yet received — using fallback intrinsics. "
                 f"fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}"
             )
 
         # --- 3. Call Grounded SAM2 --------------------------------------
-        rospy.loginfo(f"Calling Grounded SAM2 | prompt='{text_prompt}'")
+        rospy.loginfo(f"Calling Grounded SAM2 | prompt='{text_prompt}' camera='{cam.name}'")
         sam2_result, sam2_err = self._call_sam2(
-            rgb, depth, fx, fy, cx, cy, text_prompt
+            rgb, depth, fx, fy, cx, cy, text_prompt, cam
         )
 
         if sam2_err:
@@ -362,7 +443,7 @@ class SegmentAndGraspNode:
             f"quat=({q['x']:.4f}, {q['y']:.4f}, {q['z']:.4f}, {q['w']:.4f})"
         )
 
-        t_base, q_base, tf_err = self._transform_pose_to_base(t, q)
+        t_base, q_base, tf_err = self._transform_pose_to_base(t, q, cam.camera_frame)
 
         if tf_err:
             rospy.logwarn(
@@ -381,8 +462,6 @@ class SegmentAndGraspNode:
             # Then rotate 90° around -Y to align gripper approach with +Z in base frame
             q_90yz = {"x": 0.0, "y": -0.7071068, "z": 0.0, "w": 0.7071068}
             q_base = _quaternion_multiply(q_base, q_90yz)
-            # q__180z = {"x": 0.0, "y": 0.0, "z": 1.0, "w": 0.0}
-            # q_base = _quaternion_multiply(q_base, q__180z)
 
             # Apply a backward shift of 0.17m along the grasp pose's local X
             try:
@@ -455,6 +534,7 @@ class SegmentAndGraspNode:
                 "score":  best["score"],
                 "width":  best["width"],
             },
+            "camera": cam.name,
         }
 
         response.result_code.result_code = ResultCode.SUCCESS
@@ -466,42 +546,35 @@ class SegmentAndGraspNode:
     #  TF pose transform helper                                          #
     # ------------------------------------------------------------------ #
 
-    def _transform_pose_to_base(self, translation, quaternion):
+    def _transform_pose_to_base(self, translation, quaternion, camera_frame):
         """
-        Transform a pose from self.camera_frame to self.base_frame using
-        the ROS1 tf.TransformListener:
-          1. Look up (trans, rot) for target←source with waitForTransform.
-          2. Express the pose as a 4x4 homogeneous matrix.
-          3. Multiply: pose_base = T_base_cam @ pose_cam.
-          4. Extract translation and quaternion from the result.
+        Transform a pose from camera_frame to self.base_frame using
+        the ROS1 tf.TransformListener.
 
         Args:
-            translation (list): [x, y, z] in camera frame
-            quaternion  (dict): {"x", "y", "z", "w"} in camera frame
+            translation  (list): [x, y, z] in camera frame
+            quaternion   (dict): {"x", "y", "z", "w"} in camera frame
+            camera_frame (str):  the source TF frame for the selected camera
 
         Returns:
             tuple: (t_base, q_base, error_string)
-                  ([x,y,z                ], {"x","y","z","w"}, None)
-                  (None, None,               error_string)
         """
         try:
-            # Wait for the transform to become available
             self._tf_listener.waitForTransform(
                 self.base_frame,
-                self.camera_frame,
-                rospy.Time(0),                       # latest available
+                camera_frame,
+                rospy.Time(0),
                 rospy.Duration(self.tf_timeout_sec),
             )
 
-            # Get the transform: (trans=[x,y,z], rot=[x,y,z,w])
             trans, rot = self._tf_listener.lookupTransform(
                 self.base_frame,
-                self.camera_frame,
+                camera_frame,
                 rospy.Time(0),
             )
 
             # Build 4x4 homogeneous transform  T_base_cam
-            T_base_cam = tft.quaternion_matrix(rot)          # 4x4, rotation part
+            T_base_cam = tft.quaternion_matrix(rot)
             T_base_cam[0, 3] = trans[0]
             T_base_cam[1, 3] = trans[1]
             T_base_cam[2, 3] = trans[2]
@@ -523,8 +596,7 @@ class SegmentAndGraspNode:
                 T_pose_base[2, 3],
             ]
 
-            # Extract quaternion from the rotational part
-            q_out = tft.quaternion_from_matrix(T_pose_base)   # [x, y, z, w]
+            q_out = tft.quaternion_from_matrix(T_pose_base)
             q_base = {"x": float(q_out[0]), "y": float(q_out[1]),
                       "z": float(q_out[2]), "w": float(q_out[3])}
 
@@ -539,21 +611,21 @@ class SegmentAndGraspNode:
         except Exception as e:
             return None, None, f"Unexpected TF error: {e}\n{traceback.format_exc()}"
 
-    def _get_cam_to_base_quat(self):
+    def _get_cam_to_base_quat(self, camera_frame):
         """
-        Look up the TF from base_frame and return
-        [qx              , qy, qz, qw], or None if unavailable.
+        Look up the TF from camera_frame to base_frame and return
+        [qx, qy, qz, qw], or None if unavailable.
         """
         try:
             self._tf_listener.waitForTransform(
                 self.base_frame,
-                self.camera_frame,
+                camera_frame,
                 rospy.Time(0),
                 rospy.Duration(self.tf_timeout_sec),
             )
             _trans, rot = self._tf_listener.lookupTransform(
                 self.base_frame,
-                self.camera_frame,
+                camera_frame,
                 rospy.Time(0),
             )
             rospy.loginfo(
@@ -573,13 +645,13 @@ class SegmentAndGraspNode:
     #  SAM2 WebSocket call                                                 #
     # ------------------------------------------------------------------ #
 
-    def _call_sam2(self, rgb, depth, fx, fy, cx, cy, text_prompt):
+    def _call_sam2(self, rgb, depth, fx, fy, cx, cy, text_prompt, cam):
         """
         Returns (result_dict, error_string). Exactly one is None.
         """
         try:
-            role = "scene"
-            depth_scale = rospy.get_param(f"/realsense/{role}/depth_scale", 0.001)
+            # Per-camera depth_scale param, e.g. /realsense/scene/depth_scale
+            depth_scale = rospy.get_param(f"/realsense/{cam.name}/depth_scale", 0.001)
             payload = {
                 "text_prompt": text_prompt,
                 "rgb":         self._encode_rgb(rgb),
@@ -588,7 +660,7 @@ class SegmentAndGraspNode:
                 "depth_scale": float(depth_scale)
             }
 
-            cam_to_base_quat = self._get_cam_to_base_quat()
+            cam_to_base_quat = self._get_cam_to_base_quat(cam.camera_frame)
             if cam_to_base_quat is not None:
                 payload["cam_to_base_quat"] = cam_to_base_quat
             else:
@@ -698,13 +770,6 @@ class SegmentAndGraspNode:
     def _fail(self, response, msg):
         """
         Populate *response* as a failure and log the error.
-
-        Args:
-            response (RobotCommandResponse): to mutate
-            msg      (str):                 human-readable error
-
-        Returns:
-            RobotCommandResponse
         """
         rospy.logerr(f"detect_objects service error: {msg}")
         response.result_code.result_code = ResultCode.FAILURE

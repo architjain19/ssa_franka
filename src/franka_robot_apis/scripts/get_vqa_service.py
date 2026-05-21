@@ -7,9 +7,9 @@ Service: /robot/perception/get_vqa_response  (robot_api_interfaces/RobotCommand)
 Request JSON format:
 {
     "prompt": "What objects are on the table?",
-    "image_topic": "/camera/color/image_raw",   # optional, overrides default
-    "max_tokens": 512,                           # optional, default 512
-    "temperature": 0.1                           # optional, default 0.1
+    "camera": "scene",        # "wrist" or "scene" (default: "scene")
+    "max_tokens": 512,        # optional, default 512
+    "temperature": 0.1        # optional, default 0.1
 }
 
 Response JSON format:
@@ -17,15 +17,21 @@ Response JSON format:
     "result_code": 0,
     "message": "Success",
     "data": {
-        "answer": "I can see a cup, a plate..."
+        "answer": "I can see a cup, a plate...",
+        "camera": "scene"
     }
 }
 
 ROS1 usage:
     rosrun franka_robot_apis get_vqa_service.py
 
+    # Scene camera (default)
     rosservice call /robot/perception/get_vqa_response \
-        '{"req": "{\"prompt\": \"Is there an aruco marker?\"}"}'
+        '{"req": "{\"prompt\": \"Is there an aruco marker?\", \"camera\": \"scene\"}"}'
+
+    # Wrist camera
+    rosservice call /robot/perception/get_vqa_response \
+        '{"req": "{\"prompt\": \"What is below the gripper?\", \"camera\": \"wrist\"}"}'
 """
 
 import json
@@ -55,6 +61,10 @@ except ImportError:
     NUMPY_AVAILABLE = False
 
 import cv2  # for JPEG encoding
+
+
+# Allowed values for the "camera" field in the request JSON.
+VALID_CAMERAS = ("wrist", "scene")
 
 
 # ---------------------------------------------------------------------------
@@ -136,9 +146,11 @@ class VQAServiceNode:
     ROS1 service node wrapping a Qwen2.5-VL vLLM server.
 
     VQAServiceNode architecture:
-      - Subscribes to a configurable camera topic (lazy, on demand)
-      - Caches the latest frame with a staleness timeout
+      - Subscribes to wrist and scene camera topics at startup
+      - Caches the latest frame per topic with a staleness timeout
       - Exposes /robot/perception/get_vqa_response (RobotCommand.srv)
+      - Selects the camera per request via the "camera" field
+        ("wrist" or "scene"); defaults to ~default_camera if unspecified.
     """
 
     def __init__(self):
@@ -147,7 +159,26 @@ class VQAServiceNode:
         # ------------------------------------------------------------------
         self.qwen_host           = rospy.get_param("~qwen_host",          "10.158.54.164")
         self.qwen_port           = rospy.get_param("~qwen_port",          8000)
-        self.default_image_topic = rospy.get_param("~default_image_topic", "/zed/scene/color/image_raw")
+
+        # Per-camera image topics. Both can be remapped via params.
+        self.scene_image_topic   = rospy.get_param("~scene_image_topic", "/zed/scene/color/image_raw")
+        self.wrist_image_topic   = rospy.get_param("~wrist_image_topic", "/zed/wrist/color/image_raw")
+
+        # Which camera to use when the request does not specify one.
+        self.default_camera      = rospy.get_param("~default_camera", "scene").lower()
+        if self.default_camera not in VALID_CAMERAS:
+            rospy.logwarn(
+                f"~default_camera='{self.default_camera}' is invalid; "
+                f"falling back to 'scene'. Valid options: {VALID_CAMERAS}"
+            )
+            self.default_camera = "scene"
+
+        # Mapping from camera name -> topic.
+        self.camera_topics = {
+            "scene": self.scene_image_topic,
+            "wrist": self.wrist_image_topic,
+        }
+
         self.image_cache_timeout = float(rospy.get_param("~image_cache_timeout", 1.0))
         self.default_max_tokens  = int(rospy.get_param("~default_max_tokens",  512))
         self.default_temperature = float(rospy.get_param("~default_temperature", 0.1))
@@ -265,9 +296,12 @@ class VQAServiceNode:
                 )
 
         # ------------------------------------------------------------------
-        # Subscribe to the default camera topic immediately
+        # Subscribe to both camera topics at startup so frames are ready
+        # whichever camera the first request picks.
         # ------------------------------------------------------------------
-        self._ensure_subscription(self.default_image_topic)
+        for cam_name, topic in self.camera_topics.items():
+            rospy.loginfo(f"Subscribing to {cam_name} camera topic: {topic}")
+            self._ensure_subscription(topic)
 
         # ------------------------------------------------------------------
         # Advertise the ROS1 service
@@ -280,12 +314,13 @@ class VQAServiceNode:
 
         rospy.loginfo(
             "\nVQAServiceNode initialized.\n"
-            f"  Service:       /robot/perception/get_vqa_response\n"
-            # f"  VQA server:    {'local Qwen2.5-VL at http://{self.qwen_host}:{self.qwen_port}/v1' if self.vqa_server_name == "qwen" else 'OpenAI API'}\n"
-            f"  Model:         {self.model_id}\n"
-            f"  Default topic: {self.default_image_topic}\n"
-            f"  OpenAI client: {'available' if self._client else 'UNAVAILABLE'}\n"
-            f"  numpy:         {'available' if NUMPY_AVAILABLE else 'UNAVAILABLE'}"
+            f"  Service:        /robot/perception/get_vqa_response\n"
+            f"  Model:          {self.model_id}\n"
+            f"  Scene topic:    {self.scene_image_topic}\n"
+            f"  Wrist topic:    {self.wrist_image_topic}\n"
+            f"  Default camera: {self.default_camera}\n"
+            f"  OpenAI client:  {'available' if self._client else 'UNAVAILABLE'}\n"
+            f"  numpy:          {'available' if NUMPY_AVAILABLE else 'UNAVAILABLE'}"
         )
 
     # ------------------------------------------------------------------
@@ -296,10 +331,6 @@ class VQAServiceNode:
         """
         Create a rospy.Subscriber for *topic* if one does not already exist.
         Thread-safe.
-
-        In ROS1 all subscribers are implicitly thread-safe through the GIL
-        and rospy's internal locking, but we guard _image_subs explicitly
-        to be safe when called from the service callback thread.
         """
         with self._subs_lock:
             if topic in self._image_subs:
@@ -312,9 +343,6 @@ class VQAServiceNode:
                 with self._image_cache_lock:
                     self._image_cache[_topic] = (msg, time.time())
 
-            # ROS1: queue_size=1 + buff_size large enough for HD images.
-            # There is no QoS profile object in ROS1; BEST_EFFORT is the
-            # default UDP behaviour which rospy uses automatically for Image.
             sub = rospy.Subscriber(
                 topic,
                 Image,
@@ -378,23 +406,39 @@ class VQAServiceNode:
         if not prompt:
             return self._fail(response, "Missing or empty 'prompt' in request JSON.")
 
-        image_topic = req_data.get("image_topic", self.default_image_topic)
+        # --- 2. Resolve which camera/topic to use ---
+        camera = req_data.get("camera", self.default_camera)
+        if not isinstance(camera, str):
+            return self._fail(
+                response,
+                f"'camera' must be a string, got {type(camera).__name__}.",
+            )
+        camera = camera.strip().lower()
+        if camera not in self.camera_topics:
+            return self._fail(
+                response,
+                f"Invalid 'camera' value: '{camera}'. "
+                f"Must be one of: {list(self.camera_topics.keys())}.",
+            )
+        image_topic = self.camera_topics[camera]
+
         max_tokens  = int(req_data.get("max_tokens",  self.default_max_tokens))
         temperature = float(req_data.get("temperature", self.default_temperature))
 
         rospy.loginfo(
-            f"Query params - topic: '{image_topic}', "
+            f"Query params - camera: '{camera}', topic: '{image_topic}', "
             f"max_tokens: {max_tokens}, temperature: {temperature}\n"
             f"Prompt: {prompt}"
         )
 
-        # --- 2. Ensure we are subscribed to the requested topic ---
-        self._ensure_subscription(image_topic)
-
         # --- 3. Retrieve latest image ---
         img_msg, img_error = self._get_cached_image(image_topic)
         if img_msg is None:
-            return self._fail(response, f"Image unavailable: {img_error}")
+            return self._fail(
+                response,
+                f"Image unavailable for camera '{camera}' "
+                f"(topic '{image_topic}'): {img_error}",
+            )
 
         # --- 4. Convert ROS image -> base64 JPEG ---
         try:
@@ -409,7 +453,7 @@ class VQAServiceNode:
 
         rospy.loginfo(
             f"Image converted successfully "
-            f"(encoding={encoding_used}, "
+            f"(camera={camera}, encoding={encoding_used}, "
             f"size={img_msg.width}x{img_msg.height}, "
             f"b64_len={len(b64_image)})"
         )
@@ -435,7 +479,7 @@ class VQAServiceNode:
             return self._fail(response, f"VQA inference failed: {e}")
 
         # --- 7. Build success response ---
-        rospy.loginfo(f"VQA answer: {answer}")
+        rospy.loginfo(f"VQA answer ({camera}): {answer}")
 
         response.result_code.result_code = ResultCode.SUCCESS
         response.result_code.message     = "Success"
@@ -444,6 +488,7 @@ class VQAServiceNode:
             "message": "Success",
             "data": {
                 "answer": answer,
+                "camera": camera,
             },
         })
         return response

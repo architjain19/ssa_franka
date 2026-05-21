@@ -6,7 +6,8 @@ Service: /robot/perception/get_object_mask  (robot_api_interfaces/RobotCommand)
 
 Request (JSON string in .req field):
 {
-    "text_prompt": "glass"
+    "text_prompt": "glass",
+    "camera": "scene"      # "wrist" or "scene" (default: "scene")
 }
 
 Response (JSON string in .data field):
@@ -27,14 +28,20 @@ Response (JSON string in .data field):
     "num_detections":   1,
     "detected_labels":  ["purple floor"],
     "confidences":      [0.6858],
-    "has_orientation":  false
+    "has_orientation":  false,
+    "camera":           "scene"
 }
 
 ROS1 usage:
     rosrun franka_robot_apis get_object_mask_service.py
 
+    # Scene camera (default)
     rosservice call /robot/perception/get_object_mask \
-        '{"req": "{\"text_prompt\": \"floor\"}"}'
+        '{"req": "{\"text_prompt\": \"floor\", \"camera\": \"scene\"}"}'
+
+    # Wrist camera
+    rosservice call /robot/perception/get_object_mask \
+        '{"req": "{\"text_prompt\": \"cup\", \"camera\": \"wrist\"}"}'
 """
 
 import json
@@ -58,6 +65,43 @@ from robot_api_interfaces.srv import RobotCommand, RobotCommandResponse
 from robot_api_interfaces.msg import ResultCode
 
 
+# Allowed values for the "camera" field in the request JSON.
+VALID_CAMERAS = ("wrist", "scene")
+
+
+# ---------------------------------------------------------------------------
+# Per-camera state holder
+# ---------------------------------------------------------------------------
+class CameraState:
+    """
+    Holds the latest RGB/depth frames, intrinsics, topic names, and the
+    TF frame for a single camera (e.g. "scene" or "wrist").
+
+    Each camera has its own lock so RGB/depth updates from independent
+    subscriber threads don't contend with each other.
+    """
+
+    def __init__(self, name, rgb_topic, depth_topic, camera_info_topic,
+                 camera_frame, fx, fy, cx, cy):
+        self.name              = name
+        self.rgb_topic         = rgb_topic
+        self.depth_topic       = depth_topic
+        self.camera_info_topic = camera_info_topic
+        self.camera_frame      = camera_frame
+
+        # Fallback intrinsics — overwritten on first CameraInfo message.
+        self.fx = fx
+        self.fy = fy
+        self.cx = cx
+        self.cy = cy
+        self.camera_info_received = False
+
+        self.latest_rgb   = None   # np.ndarray uint8  (H,W,3) BGR
+        self.latest_depth = None   # np.ndarray uint16 (H,W)
+
+        self.lock = threading.Lock()
+
+
 # ---------------------------------------------------------------------------
 # Main service class
 # ---------------------------------------------------------------------------
@@ -66,8 +110,9 @@ class GetObjectMaskNode:
     ROS1 service node wrapping the Grounded SAM2 /get_object_mask WebSocket
     endpoint.
 
-    Captures an RGB + depth frame, ships them to the SAM2 server, validates
-    the returned NPZ payload, and forwards it verbatim to the caller.
+    Captures an RGB + depth frame from the requested camera ("scene" or
+    "wrist"), ships them to the SAM2 server, validates the returned NPZ
+    payload, and forwards it verbatim to the caller.
     """
 
     def __init__(self):
@@ -78,55 +123,98 @@ class GetObjectMaskNode:
             "~sam2_url", "ws://10.158.54.164:8766/get_object_mask"
         )
 
-        # Camera topics — same RealSense serial used in detect_objects node
-        self.rgb_topic         = rospy.get_param("~rgb_topic",         "/zed/scene/color/image_raw")
-        self.depth_topic       = rospy.get_param("~depth_topic",       "/zed/scene/aligned_depth_to_color/image_raw")
-        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/zed/scene/aligned_depth_to_color/camera_info")
+        # --- Scene camera params ---
+        scene_rgb_topic   = rospy.get_param("~scene_rgb_topic",         "/zed/scene/color/image_raw")
+        scene_depth_topic = rospy.get_param("~scene_depth_topic",       "/zed/scene/aligned_depth_to_color/image_raw")
+        scene_info_topic  = rospy.get_param("~scene_camera_info_topic", "/zed/scene/aligned_depth_to_color/camera_info")
+        scene_frame       = rospy.get_param("~scene_camera_frame",      "zed_scene_left_optical_frame")
+        scene_fx = float(rospy.get_param("~scene_fx", 752.0038452148438))
+        scene_fy = float(rospy.get_param("~scene_fy", 751.7178344726562))
+        scene_cx = float(rospy.get_param("~scene_cx", 628.4379272460938))
+        scene_cy = float(rospy.get_param("~scene_cy", 335.1157531738281))
 
-        # Fallback intrinsics (used only if camera_info never arrives)
-        self.fx_default = float(rospy.get_param("~fx", 752.0038452148438))
-        self.fy_default = float(rospy.get_param("~fy", 751.7178344726562))
-        self.cx_default = float(rospy.get_param("~cx", 628.4379272460938))
-        self.cy_default = float(rospy.get_param("~cy", 335.1157531738281))
+        # --- Wrist camera params ---
+        wrist_rgb_topic   = rospy.get_param("~wrist_rgb_topic",         "/zed/wrist/color/image_raw")
+        wrist_depth_topic = rospy.get_param("~wrist_depth_topic",       "/zed/wrist/aligned_depth_to_color/image_raw")
+        wrist_info_topic  = rospy.get_param("~wrist_camera_info_topic", "/zed/wrist/aligned_depth_to_color/camera_info")
+        wrist_frame       = rospy.get_param("~wrist_camera_frame",      "zed_wrist_left_optical_frame")
+        # Wrist intrinsics default to scene's values; override in the launch
+        # file once you have the real wrist camera calibration.
+        wrist_fx = float(rospy.get_param("~wrist_fx", scene_fx))
+        wrist_fy = float(rospy.get_param("~wrist_fy", scene_fy))
+        wrist_cx = float(rospy.get_param("~wrist_cx", scene_cx))
+        wrist_cy = float(rospy.get_param("~wrist_cy", scene_cy))
 
-        # Timeouts
+        # Default camera when the request does not specify one.
+        self.default_camera = rospy.get_param("~default_camera", "scene").lower()
+        if self.default_camera not in VALID_CAMERAS:
+            rospy.logwarn(
+                f"~default_camera='{self.default_camera}' is invalid; "
+                f"falling back to 'scene'. Valid options: {VALID_CAMERAS}"
+            )
+            self.default_camera = "scene"
+
+        # Timeouts / limits
         self.camera_wait_sec     = float(rospy.get_param("~camera_wait_sec",     1.0))
         self.sam2_timeout_sec    = float(rospy.get_param("~sam2_timeout_sec",    15.0))
         self.response_max_npz_mb = float(rospy.get_param("~response_max_npz_mb", 25.0))
 
-        # TF parameters
-        self.camera_frame  = rospy.get_param("~camera_frame",   "zed_scene_left_optical_frame")
-        self.base_frame    = rospy.get_param("~base_frame",     "panda_link0")
-        self.tf_timeout_sec= float(rospy.get_param("~tf_timeout_sec", 2.0))
+        # TF parameters (base_frame is shared; per-camera frame lives on CameraState).
+        self.base_frame     = rospy.get_param("~base_frame",     "panda_link0")
+        self.tf_timeout_sec = float(rospy.get_param("~tf_timeout_sec", 2.0))
 
         # ------------------------------------------------------------------ #
-        #  Camera state                                                        #
+        #  Camera state — one CameraState object per camera                    #
         # ------------------------------------------------------------------ #
-        self.latest_rgb           = None   # np.ndarray uint8  (H,W,3) BGR
-        self.latest_depth         = None   # np.ndarray uint16 (H,W)
-        self.fx                   = self.fx_default
-        self.fy                   = self.fy_default
-        self.cx                   = self.cx_default
-        self.cy                   = self.cy_default
-        self.camera_info_received = False
-        self._cam_lock            = threading.Lock()
+        self.cameras = {
+            "scene": CameraState(
+                name="scene",
+                rgb_topic=scene_rgb_topic,
+                depth_topic=scene_depth_topic,
+                camera_info_topic=scene_info_topic,
+                camera_frame=scene_frame,
+                fx=scene_fx, fy=scene_fy, cx=scene_cx, cy=scene_cy,
+            ),
+            "wrist": CameraState(
+                name="wrist",
+                rgb_topic=wrist_rgb_topic,
+                depth_topic=wrist_depth_topic,
+                camera_info_topic=wrist_info_topic,
+                camera_frame=wrist_frame,
+                fx=wrist_fx, fy=wrist_fy, cx=wrist_cx, cy=wrist_cy,
+            ),
+        }
 
         # ------------------------------------------------------------------ #
-        #  Subscriptions                                                       #
+        #  TF — a single Buffer/Listener pair is enough for any frame pair.   #
+        #  Create them once at startup so the buffer has time to fill        #
+        #  before the first service call.                                     #
         # ------------------------------------------------------------------ #
-        rospy.Subscriber(
-            self.rgb_topic, Image, self._rgb_cb,
-            queue_size=1, buff_size=2 ** 24,   # 16 MB — fits HD colour frames
-        )
-        rospy.Subscriber(
-            self.depth_topic, Image, self._depth_cb,
-            queue_size=1, buff_size=2 ** 24,
-        )
-        # CameraInfo is small and typically latched — default reliable QoS fine
-        rospy.Subscriber(
-            self.camera_info_topic, CameraInfo, self._camera_info_cb,
-            queue_size=10,
-        )
+        import tf2_ros
+        self._tf2_ros     = tf2_ros
+        self._tf_buffer   = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer)
+
+        # ------------------------------------------------------------------ #
+        #  Subscriptions — one set per camera                                  #
+        # ------------------------------------------------------------------ #
+        self._subs = []
+        for cam in self.cameras.values():
+            self._subs.append(rospy.Subscriber(
+                cam.rgb_topic, Image,
+                lambda msg, _cam=cam: self._rgb_cb(msg, _cam),
+                queue_size=1, buff_size=2 ** 24,   # 16 MB — fits HD colour frames
+            ))
+            self._subs.append(rospy.Subscriber(
+                cam.depth_topic, Image,
+                lambda msg, _cam=cam: self._depth_cb(msg, _cam),
+                queue_size=1, buff_size=2 ** 24,
+            ))
+            self._subs.append(rospy.Subscriber(
+                cam.camera_info_topic, CameraInfo,
+                lambda msg, _cam=cam: self._camera_info_cb(msg, _cam),
+                queue_size=10,
+            ))
 
         # ------------------------------------------------------------------ #
         #  Service                                                             #
@@ -139,18 +227,27 @@ class GetObjectMaskNode:
 
         rospy.loginfo(
             "\nGetObjectMaskNode (ROS1) ready.\n"
-            f"  Service     : /robot/perception/get_object_mask\n"
-            f"  SAM2        : {self.sam2_url}\n"
-            f"  RGB         : {self.rgb_topic}\n"
-            f"  Depth       : {self.depth_topic}\n"
-            f"  CamInfo     : {self.camera_info_topic}"
+            f"  Service        : /robot/perception/get_object_mask\n"
+            f"  SAM2           : {self.sam2_url}\n"
+            f"  Default camera : {self.default_camera}\n"
+            f"  Base frame     : {self.base_frame}\n"
+            f"  --- scene ---\n"
+            f"  RGB            : {self.cameras['scene'].rgb_topic}\n"
+            f"  Depth          : {self.cameras['scene'].depth_topic}\n"
+            f"  CamInfo        : {self.cameras['scene'].camera_info_topic}\n"
+            f"  Frame          : {self.cameras['scene'].camera_frame}\n"
+            f"  --- wrist ---\n"
+            f"  RGB            : {self.cameras['wrist'].rgb_topic}\n"
+            f"  Depth          : {self.cameras['wrist'].depth_topic}\n"
+            f"  CamInfo        : {self.cameras['wrist'].camera_info_topic}\n"
+            f"  Frame          : {self.cameras['wrist'].camera_frame}"
         )
 
     # ------------------------------------------------------------------ #
     #  Camera callbacks — ros_numpy replaces CvBridge                     #
     # ------------------------------------------------------------------ #
 
-    def _rgb_cb(self, msg):
+    def _rgb_cb(self, msg, cam):
         """
         Convert sensor_msgs/Image -> BGR uint8 numpy array using ros_numpy.
 
@@ -170,12 +267,12 @@ class GetObjectMaskNode:
             elif enc == "bgra8":
                 img = img[..., :3].copy()                    # drop alpha, BGR
             # bgr8 / mono encodings: use as-is
-            with self._cam_lock:
-                self.latest_rgb = img
+            with cam.lock:
+                cam.latest_rgb = img
         except Exception as e:
-            rospy.logwarn(f"RGB decode error: {e}")
+            rospy.logwarn(f"[{cam.name}] RGB decode error: {e}")
 
-    def _depth_cb(self, msg):
+    def _depth_cb(self, msg, cam):
         """
         Convert sensor_msgs/Image -> uint16 numpy array using ros_numpy.
 
@@ -186,27 +283,27 @@ class GetObjectMaskNode:
             img = ros_numpy.numpify(msg)          # (H,W) uint16 typically
             if img.dtype != np.uint16:
                 img = img.astype(np.uint16)
-            with self._cam_lock:
-                self.latest_depth = img
+            with cam.lock:
+                cam.latest_depth = img
         except Exception as e:
-            rospy.logwarn(f"Depth decode error: {e}")
+            rospy.logwarn(f"[{cam.name}] Depth decode error: {e}")
 
-    def _camera_info_cb(self, msg):
+    def _camera_info_cb(self, msg, cam):
         """
         Cache camera intrinsics on first receipt.
         K = [fx, 0, cx, 0, fy, cy, 0, 0, 1]
         """
-        with self._cam_lock:
-            if not self.camera_info_received:
-                self.fx = float(msg.K[0])
-                self.fy = float(msg.K[4])
-                self.cx = float(msg.K[2])
-                self.cy = float(msg.K[5])
-                self.camera_info_received = True
+        with cam.lock:
+            if not cam.camera_info_received:
+                cam.fx = float(msg.K[0])
+                cam.fy = float(msg.K[4])
+                cam.cx = float(msg.K[2])
+                cam.cy = float(msg.K[5])
+                cam.camera_info_received = True
                 rospy.loginfo(
-                    f"Camera intrinsics received: "
-                    f"fx={self.fx:.2f} fy={self.fy:.2f} "
-                    f"cx={self.cx:.2f} cy={self.cy:.2f}"
+                    f"[{cam.name}] Camera intrinsics received: "
+                    f"fx={cam.fx:.2f} fy={cam.fy:.2f} "
+                    f"cx={cam.cx:.2f} cy={cam.cy:.2f}"
                 )
 
     # ------------------------------------------------------------------ #
@@ -233,14 +330,37 @@ class GetObjectMaskNode:
         except (json.JSONDecodeError, ValueError) as e:
             return self._fail(response, f"Bad request: {e}")
 
-        # --- 2. Wait for camera frames ----------------------------------
-        rospy.loginfo(f"Waiting up to {self.camera_wait_sec}s for camera frames ...")
+        # --- 2. Resolve which camera to use -----------------------------
+        camera = req_data.get("camera", self.default_camera)
+        if not isinstance(camera, str):
+            return self._fail(
+                response,
+                f"'camera' must be a string, got {type(camera).__name__}.",
+            )
+        camera = camera.strip().lower()
+        if camera not in self.cameras:
+            return self._fail(
+                response,
+                f"Invalid 'camera' value: '{camera}'. "
+                f"Must be one of: {list(self.cameras.keys())}.",
+            )
+        cam = self.cameras[camera]
+
+        rospy.loginfo(
+            f"Using camera='{cam.name}' | rgb='{cam.rgb_topic}' "
+            f"depth='{cam.depth_topic}' frame='{cam.camera_frame}'"
+        )
+
+        # --- 3. Wait for camera frames ----------------------------------
+        rospy.loginfo(
+            f"Waiting up to {self.camera_wait_sec}s for {cam.name} camera frames ..."
+        )
         deadline   = time.time() + self.camera_wait_sec
         has_frames = False
         while time.time() < deadline:
-            with self._cam_lock:
-                has_frames = (self.latest_rgb is not None and
-                              self.latest_depth is not None)
+            with cam.lock:
+                has_frames = (cam.latest_rgb is not None and
+                              cam.latest_depth is not None)
             if has_frames:
                 break
             time.sleep(0.05)
@@ -248,33 +368,31 @@ class GetObjectMaskNode:
         if not has_frames:
             return self._fail(
                 response,
-                f"Timed out waiting for camera frames on "
-                f"'{self.rgb_topic}' / '{self.depth_topic}'."
+                f"Timed out waiting for {cam.name} camera frames on "
+                f"'{cam.rgb_topic}' / '{cam.depth_topic}'."
             )
 
-        with self._cam_lock:
-            rgb             = self.latest_rgb.copy()
-            depth           = self.latest_depth.copy()
-            fx, fy, cx, cy  = self.fx, self.fy, self.cx, self.cy
+        with cam.lock:
+            rgb             = cam.latest_rgb.copy()
+            depth           = cam.latest_depth.copy()
+            fx, fy, cx, cy  = cam.fx, cam.fy, cam.cx, cam.cy
+            cam_info_ok     = cam.camera_info_received
 
-        if not self.camera_info_received:
+        if not cam_info_ok:
             rospy.logwarn(
-                "CameraInfo not yet received — using fallback intrinsics. "
+                f"[{cam.name}] CameraInfo not yet received — using fallback intrinsics. "
                 f"fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}"
             )
-        
-        # get homogeneous transform from camera frame to robot base frame if available
-        T_base_cam = np.eye(4)  # default to identity if no TF available
+
+        # --- 4. Look up T_base_cam for the selected camera --------------
+        T_base_cam = np.eye(4).tolist()  # default to identity if no TF available
         try:
-            import tf2_ros
             import tf2_geometry_msgs
-            tf_buffer = tf2_ros.Buffer()
-            tf_listener = tf2_ros.TransformListener(tf_buffer)
-            transform = tf_buffer.lookup_transform(
-                self.base_frame,           # target frame (robot base)
-                self.camera_frame,  # source frame (RealSense RGB camera)
-                rospy.Time(0),  # get latest available
-                rospy.Duration(self.tf_timeout_sec)  # timeout
+            transform = self._tf_buffer.lookup_transform(
+                self.base_frame,          # target frame (robot base)
+                cam.camera_frame,         # source frame (this camera)
+                rospy.Time(0),            # latest available
+                rospy.Duration(self.tf_timeout_sec),
             )
             tf_to_kdl = tf2_geometry_msgs.transform_to_kdl(transform)
             kdl_rot = tf_to_kdl.M
@@ -283,17 +401,24 @@ class GetObjectMaskNode:
                 [kdl_rot[0, 0], kdl_rot[0, 1], kdl_rot[0, 2], kdl_pos[0]],
                 [kdl_rot[1, 0], kdl_rot[1, 1], kdl_rot[1, 2], kdl_pos[1]],
                 [kdl_rot[2, 0], kdl_rot[2, 1], kdl_rot[2, 2], kdl_pos[2]],
-                [0, 0, 0, 1]
+                [0, 0, 0, 1],
             ])
-            T_base_cam = hom_matrix.tolist()  # convert to regular Python list for JSON serialization
+            T_base_cam = hom_matrix.tolist()  # JSON-serialisable
+            rospy.loginfo(
+                f"Got T_base_cam for {cam.name} ({cam.camera_frame} -> {self.base_frame})."
+            )
+        except (self._tf2_ros.LookupException,
+                self._tf2_ros.ConnectivityException,
+                self._tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn(
+                f"Could not obtain T_base_cam for {cam.name} "
+                f"({cam.camera_frame} -> {self.base_frame}): {e}. Using identity."
+            )
 
-            rospy.loginfo("Successfully obtained T_base_cam from TF.")
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
-            rospy.logwarn(f"Could not obtain T_base_cam from TF: {e}. Using identity.")
-
-        # --- 3. Call Grounded SAM2 /get_object_mask ---------------------
+        # --- 5. Call Grounded SAM2 /get_object_mask ---------------------
         rospy.loginfo(
-            f"Calling Grounded SAM2 get_object_mask | prompt='{text_prompt}'"
+            f"Calling Grounded SAM2 get_object_mask | "
+            f"prompt='{text_prompt}' camera='{cam.name}'"
         )
         sam2_result, sam2_err = self._call_sam2(
             rgb, depth, fx, fy, cx, cy, text_prompt, T_base_cam
@@ -309,7 +434,7 @@ class GetObjectMaskNode:
                 f"{sam2_result.get('message', json.dumps(sam2_result))}"
             )
 
-        # --- 4. Validate / summarise the NPZ payload --------------------
+        # --- 6. Validate / summarise the NPZ payload --------------------
         npz_b64       = sam2_result.get("npz_base64")
         data_encoding = sam2_result.get("data_encoding")
 
@@ -341,7 +466,7 @@ class GetObjectMaskNode:
                 f"dtype={field_info['dtype']}"
             )
 
-        # --- 5. Build and return response -
+        # --- 7. Build and return response -------------------------------
         payload = {
             "status":       "success",
             "message":      sam2_result.get(
@@ -358,7 +483,8 @@ class GetObjectMaskNode:
             "detected_labels":  sam2_result.get("detected_labels", []),
             "confidences":      sam2_result.get("confidences", []),
             "has_orientation":  sam2_result.get("has_orientation", False),
-            "has_T_base_cam":      sam2_result.get("has_T_base_cam", None),
+            "has_T_base_cam":   sam2_result.get("has_T_base_cam", None),
+            "camera":           cam.name,
         }
 
         response.result_code.result_code = ResultCode.SUCCESS
@@ -366,7 +492,7 @@ class GetObjectMaskNode:
         response.data                    = json.dumps(payload)
 
         rospy.loginfo(
-            f"get_object_mask detected labels: "
+            f"get_object_mask ({cam.name}) detected labels: "
             f"{json.dumps(payload.get('detected_labels', []))}"
         )
         return response
@@ -406,13 +532,15 @@ class GetObjectMaskNode:
     #  SAM2 WebSocket call                                                 #
     # ------------------------------------------------------------------ #
 
-    def _call_sam2(self, rgb, depth, fx, fy, cx, cy, text_prompt, T_base_cam=np.eye(4)):
+    def _call_sam2(self, rgb, depth, fx, fy, cx, cy, text_prompt, T_base_cam=None):
         """
         Send RGB + depth + prompt to the SAM2 /get_object_mask endpoint.
 
         Returns:
             tuple: (result_dict, error_string) — exactly one is None.
         """
+        if T_base_cam is None:
+            T_base_cam = np.eye(4).tolist()
         try:
             payload = {
                 "text_prompt": text_prompt,
@@ -443,7 +571,7 @@ class GetObjectMaskNode:
             return None, f"Unexpected SAM2 error: {e}\n{traceback.format_exc()}"
 
     # ------------------------------------------------------------------ #
-    #  Shared async WebSocket primitive  (unchanged from ROS2 version)    #
+    #  Shared async WebSocket primitive                                    #
     # ------------------------------------------------------------------ #
 
     async def _ws_send_recv(self, url, payload_str, timeout_sec, max_msg_mb=50):
@@ -469,7 +597,7 @@ class GetObjectMaskNode:
                     )
 
     # ------------------------------------------------------------------ #
-    #  Image encoding helpers  (unchanged from ROS2 version)              #
+    #  Image encoding helpers                                              #
     # ------------------------------------------------------------------ #
 
     @staticmethod
