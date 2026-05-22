@@ -149,8 +149,8 @@ class MoveEEControllerNode:
         self._cancel_hook = None
 
         self.reset_robot_pose_config = {
-            "position":    {"x": 0.35, "y": 0.0, "z": 0.65},
-            "orientation": {"x": 0.9381642040183052, "y": -0.030248377974380142, "z": 0.344855954687452, "w": 0.0027078488186944366},
+            "position":    {"x": 0.4, "y": 0.0, "z": 0.45},
+            "orientation": {"x": 1.0, "y": 0.0, "z": 0.0, "w": 0.0},
         }
 
         # ===== ROS Services =====
@@ -1474,42 +1474,75 @@ class MoveEEControllerNode:
 
     def _handle_reset_robot(self, req):
         """
-        /robot/control/reset_robot — move to hard-coded home pose.
+        /robot/control/reset_robot — move to hard-coded home pose using the
+        same WebSocket / curobo trajectory pipeline as move_ee_to_pose.
+
+        Internally this forwards a RobotCommand request to
+        _handle_move_ee_to_pose with gripper_shift=0.0 (the home pose
+        is already the desired TCP pose, not a grasp pose, so no
+        approach-axis offset is applied).
         """
         response = RobotQueryResponse()
         try:
-            reset_pose = self.reset_robot_pose_config
-
             if not self.has_received_data:
                 response.result_code.result_code = ResultCode.SERVICE_NOT_RUNNING
                 response.result_code.message     = "Robot not connected"
                 response.data = json.dumps({"success": False, "error": "Robot not connected"})
                 return response
 
-            cmd_res = self._execute_move_to_pose(reset_pose)
+            reset_req_payload = {
+                "target_pose":   self.reset_robot_pose_config
+            }
+
+            class _ReqShim:
+                """Minimal stand-in for a RobotCommand service request."""
+                __slots__ = ("req",)
+                def __init__(self, req_str):
+                    self.req = req_str
+
+            shim_req = _ReqShim(json.dumps(reset_req_payload))
+            rospy.loginfo(
+                "reset_robot: delegating to move_ee_to_pose via curobo "
+                f"trajectory (target={self.reset_robot_pose_config})"
+            )
+            cmd_res = self._handle_move_ee_to_pose(shim_req)
+
             if cmd_res.result_code.result_code != ResultCode.SUCCESS:
                 rospy.logwarn("Failed to move to reset pose: " + cmd_res.result_code.message)
                 response.result_code.result_code = ResultCode.FAILURE
                 response.result_code.message     = "Failed to move to reset pose: " + cmd_res.result_code.message
-                response.data = json.dumps({"success": False, "error": "Failed to move to reset pose: " + cmd_res.result_code.message})
+                response.data = json.dumps({
+                    "success": False,
+                    "error":   "Failed to move to reset pose: " + cmd_res.result_code.message,
+                    "move_data": cmd_res.data,
+                })
                 return response
-            
+
             # set gripper to open after reset
             gripper_cmd_res = self._set_gripper_open()
             if gripper_cmd_res.result_code.result_code != ResultCode.SUCCESS:
                 rospy.logwarn("Failed to open gripper after reset: " + gripper_cmd_res.result_code.message)
                 response.result_code.result_code = ResultCode.FAILURE
                 response.result_code.message     = "Reset succeeded but failed to open gripper: " + gripper_cmd_res.result_code.message
-                response.data = json.dumps({"success": False, "error": "Failed to open gripper after reset: " + gripper_cmd_res.result_code.message})
+                response.data = json.dumps({
+                    "success": False,
+                    "error":   "Failed to open gripper after reset: " + gripper_cmd_res.result_code.message,
+                    "move_data": cmd_res.data,
+                })
             else:
                 rospy.loginfo("Gripper opened successfully after reset.")
                 response.result_code.result_code = ResultCode.SUCCESS
                 response.result_code.message     = "Reset and gripper open succeeded"
-                response.data = json.dumps({"success": True, "message": "Reset and gripper open succeeded"})
+                response.data = json.dumps({
+                    "success":   True,
+                    "message":   "Reset and gripper open succeeded",
+                    "move_data": cmd_res.data,
+                })
 
             return response
 
         except Exception as e:
+            rospy.logerr(f"Unexpected error in _handle_reset_robot: {traceback.format_exc()}")
             response.result_code.result_code = ResultCode.FAILURE
             response.result_code.message     = str(e)
             response.data = json.dumps({"success": False, "error": str(e)})

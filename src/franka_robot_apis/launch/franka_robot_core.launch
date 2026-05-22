@@ -32,6 +32,7 @@
   <node pkg="franka_robot_apis" type="get_vqa_service.py" name="vqa_service" output="screen" />
   <node pkg="franka_robot_apis" type="detect_objects_service.py" name="object_detection_service" output="screen" />
   <node pkg="franka_robot_apis" type="get_object_mask_service.py" name="object_mask_service" output="screen" />
+  <node pkg="franka_robot_apis" type="get_grasp_config_service.py" name="grasp_config_service" output="screen" />
   <node pkg="franka_robot_apis" type="set_gripper_width_service.py" name="gripper_width_service" output="screen" />
   <node pkg="franka_robot_apis" type="get_placing_pose_service.py" name="placing_pose_service" output="screen" />
   <node pkg="franka_robot_apis" type="detect_marker_service.py" name="marker_detection_service" output="screen" />
