@@ -96,12 +96,12 @@ def parse_args():
                         "for wrist (ZED-Mini)")
 
     # Per-camera resolution (must match the resolution used during calibration)
-    p.add_argument("--scene-resolution", default="HD1080",
+    p.add_argument("--scene-resolution", default="HD720",
                    choices=ZED_RESOLUTIONS)
     p.add_argument("--wrist-resolution", default="HD720",
                    choices=ZED_RESOLUTIONS)
 
-    p.add_argument("--fps", type=int, default=30)
+    p.add_argument("--fps", type=int, default=7)
     p.add_argument("--port", type=int, default=6379)
 
     # ZED depth settings (shared across both cameras)
@@ -222,6 +222,7 @@ def list_zed_devices():
             serial = int(d.serial_number)
         except Exception:
             serial = 0
+            print(f"WARNING: failed to parse serial number from device {d.serial_number}")
         model = str(d.camera_model).replace("MODEL.", "")
         out.append((serial, model))
     return out
@@ -272,6 +273,11 @@ def open_zed_for_role(serial, resolution_str, fps, depth_mode_str,
         "model":  "plumb_bob",
         "source": "factory",
     }
+
+    # Manual exposure example
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 0)        # disable auto
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, 5)      # 0-100
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, 70)          # 0-100
     return zed, image_size_wh, factory_color
 
 
@@ -400,13 +406,19 @@ def main():
     view_enum = sl.VIEW.LEFT if use_rectified else sl.VIEW.LEFT_UNRECTIFIED
     depth_enabled = (args.depth_mode != "NONE")
     runtime = sl.RuntimeParameters()
+    runtime.confidence_threshold = 75          # lower = stricter = fewer wrong pixels
+    runtime.texture_confidence_threshold = 100 # default 100; lower if too sparse
+    runtime.enable_fill_mode = False           # True only if you want holes filled
 
     # ── agentlace callbacks ────────────────────────────────────────────────
     def observation_callback(keys):
         import cv2
         obs = {}
         for serial, zed in zeds.items():
-            if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+            # if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+            err = zed.grab(runtime)
+            if err != sl.ERROR_CODE.SUCCESS:
+                print(f"[{serial}] grab failed: {err}")
                 continue
             holders = image_holders[serial]
 

@@ -13,7 +13,7 @@
 
   <!-- Static Transform Publisher -->
   <node pkg="tf2_ros" type="static_transform_publisher" name="gripper_to_panda_ee_tf" 
-        args="-0.080017 0.028425 0.024272 0.162879 -0.126995 0.718345 -0.664322 panda_link8 zed_wrist_left_optical_frame" />
+        args="-0.067889 0.027693 0.026642 0.122394 -0.122913 0.716456 -0.675724 panda_link8 zed_wrist_left_optical_frame" />
 
   <!-- Robotiq Gripper Node -->
   <node pkg="robotiq_2f_gripper_control" type="Robotiq2FGripperRtuNode.py" name="robotiq_gripper" 
