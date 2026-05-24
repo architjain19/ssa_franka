@@ -110,9 +110,9 @@ class MarkerDetectionService:
         self.service_name = rospy.get_param("~service_name", "/robot/perception/detect_markers")
 
         # --- Scene camera topics ---
-        scene_color  = rospy.get_param("~scene_color_topic",       "/zed/scene/color/image_raw")
-        scene_info   = rospy.get_param("~scene_camera_info_topic", "/zed/scene/color/camera_info")
-        scene_depth  = rospy.get_param("~scene_depth_topic",       "/zed/scene/aligned_depth_to_color/image_raw")
+        scene_color  = rospy.get_param("~scene_color_topic",       "/realsense/scene/color/image_raw")
+        scene_info   = rospy.get_param("~scene_camera_info_topic", "/realsense/scene/color/camera_info")
+        scene_depth  = rospy.get_param("~scene_depth_topic",       "/realsense/scene/aligned_depth_to_color/image_raw")
 
         # --- Wrist camera topics ---
         wrist_color  = rospy.get_param("~wrist_color_topic",       "/zed/wrist/color/image_raw")

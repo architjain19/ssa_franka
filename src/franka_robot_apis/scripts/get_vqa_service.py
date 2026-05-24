@@ -161,7 +161,7 @@ class VQAServiceNode:
         self.qwen_port           = rospy.get_param("~qwen_port",          8000)
 
         # Per-camera image topics. Both can be remapped via params.
-        self.scene_image_topic   = rospy.get_param("~scene_image_topic", "/zed/scene/color/image_raw")
+        self.scene_image_topic   = rospy.get_param("~scene_image_topic", "/realsense/scene/color/image_raw")
         self.wrist_image_topic   = rospy.get_param("~wrist_image_topic", "/zed/wrist/color/image_raw")
 
         # Which camera to use when the request does not specify one.
@@ -210,7 +210,7 @@ class VQAServiceNode:
             except Exception as e:
                 rospy.logerr(f"Failed to read OPENAI_API_KEY from .env: {e}")
             
-            self.model_id = rospy.get_param("~model_id", "gpt-4.5-preview")
+            self.model_id = rospy.get_param("~model_id", "gpt-5.4")
             rospy.loginfo("Using OpenAI API for VQA.")
         elif self.vqa_server_name == "azure_openai":
             # read AZURE_OPENAI_API_KEY from .env
@@ -313,7 +313,7 @@ class VQAServiceNode:
         )
 
         rospy.loginfo(
-            "\nVQAServiceNode initialized.\n"
+            "\nVQAServiceNode initialirealsense.\n"
             f"  Service:        /robot/perception/get_vqa_response\n"
             f"  Model:          {self.model_id}\n"
             f"  Scene topic:    {self.scene_image_topic}\n"

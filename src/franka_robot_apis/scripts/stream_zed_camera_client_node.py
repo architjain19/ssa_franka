@@ -40,8 +40,8 @@ from agentlace.action import ActionClient, ActionConfig
 SCENE_SERIAL = 39668372    # ZED 2i — scene
 WRIST_SERIAL = 16744838    # ZED-Mini — wrist
 
-SERIALS = [SCENE_SERIAL, WRIST_SERIAL]
-# SERIALS = [SCENE_SERIAL]
+# SERIALS = [SCENE_SERIAL, WRIST_SERIAL]
+SERIALS = [WRIST_SERIAL]
 
 CAMERA_ROLES = {
     WRIST_SERIAL: "wrist",
@@ -186,7 +186,7 @@ def make_client(ip, port):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip",   default="localhost")
-    parser.add_argument("--port", type=int, default=6379)
+    parser.add_argument("--port", type=int, default=6380)
     parser.add_argument("--base-frame", default="panda_link0",
                         help="TF parent frame for SCENE extrinsics "
                              "(extrinsics.frame == 'base')")

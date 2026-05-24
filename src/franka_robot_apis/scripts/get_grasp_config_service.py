@@ -147,7 +147,7 @@ class GraspFromMaskNode:
         # Per-camera TF frames - must match those used by get_object_mask.
         self.camera_frames = {
             "scene": rospy.get_param(
-                "~scene_camera_frame", "zed_scene_left_optical_frame"
+                "~scene_camera_frame", "cam_scene_color_optical_frame"
             ),
             "wrist": rospy.get_param(
                 "~wrist_camera_frame", "zed_wrist_left_optical_frame"

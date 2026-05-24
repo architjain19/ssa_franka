@@ -20,7 +20,7 @@
         args="/dev/ttyUSB0" output="screen" />
 
   <!-- Stream Camera ROS Client Node -->
-  <!-- <node pkg="franka_robot_apis" type="stream_camera_client_node.py" name="stream_camera_client" output="screen" /> -->
+  <node pkg="franka_robot_apis" type="stream_camera_client_node.py" name="stream_camera_client" output="screen" />
 
   <!-- Stream ZED Camera ROS Client Node -->
   <node pkg="franka_robot_apis" type="stream_zed_camera_client_node.py" name="stream_zed_camera_client" output="screen" />
@@ -30,6 +30,7 @@
   <node pkg="franka_robot_apis" type="execute_impedance_trajectory_node.py" name="execute_impedance_trajectory" output="screen" />
   <node pkg="franka_robot_apis" type="move_ee_cartesian_controller_node.py" name="ee_cartesian_controller" output="screen" />
   <node pkg="franka_robot_apis" type="get_vqa_service.py" name="vqa_service" output="screen" />
+  <node pkg="franka_robot_apis" type="get_grasp_vqa_service.py" name="grasp_vqa_service" output="screen" />
   <node pkg="franka_robot_apis" type="detect_objects_service.py" name="object_detection_service" output="screen" />
   <node pkg="franka_robot_apis" type="get_object_mask_service.py" name="object_mask_service" output="screen" />
   <node pkg="franka_robot_apis" type="get_grasp_config_service.py" name="grasp_config_service" output="screen" />

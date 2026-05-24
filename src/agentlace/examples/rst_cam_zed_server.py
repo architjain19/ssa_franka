@@ -59,19 +59,19 @@ from agentlace.action import ActionServer, ActionConfig
 # ── Hard-coded serials ─────────────────────────────────────────────────────
 # EDIT these to your actual ZED serial numbers. Find them by running:
 #   python zed_charuco_calib.py devices
-SCENE_SERIAL = 39668372     # ZED 2i — fixed scene camera
+# SCENE_SERIAL = 39668372     # ZED 2i — fixed scene camera
 WRIST_SERIAL = 16744838     # ZED-Mini — end-effector wrist camera
 
 CAMERA_ROLES = {
     WRIST_SERIAL: "wrist",
-    SCENE_SERIAL: "scene",
+    # SCENE_SERIAL: "scene",
 }
 
 # Valid depth range per role (mm)
 # ZED-Mini min depth is ~10 cm, ZED-2i min is ~30 cm.
 DEPTH_RANGE_MM = {
     "wrist": (100,  2000),
-    "scene": (300,  4000),
+    # "scene": (300,  4000),
 }
 
 # Resolution strings accepted by sl.RESOLUTION
@@ -102,7 +102,7 @@ def parse_args():
                    choices=ZED_RESOLUTIONS)
 
     p.add_argument("--fps", type=int, default=7)
-    p.add_argument("--port", type=int, default=6379)
+    p.add_argument("--port", type=int, default=6380)
 
     # ZED depth settings (shared across both cameras)
     p.add_argument("--depth-mode", default="NEURAL",

@@ -34,16 +34,16 @@ from agentlace.action import ActionServer, ActionConfig
 
 # ── Hard-coded serials ─────────────────────────────────────────────────────
 SCENE_SERIAL = "947122060531"   # D415 — fixed scene camera
-WRIST_SERIAL = "123622270802"   # D405 — end-effector wrist camera
+# WRIST_SERIAL = "123622270802"   # D405 — end-effector wrist camera
 
 CAMERA_ROLES = {
-    WRIST_SERIAL: "wrist",
+    # WRIST_SERIAL: "wrist",
     SCENE_SERIAL: "scene",
 }
 
 # Valid depth range per role (mm)
 DEPTH_RANGE_MM = {
-    "wrist": (50,   2000),
+    # "wrist": (50,   2000),
     "scene": (300,  4000),
 }
 
@@ -72,7 +72,7 @@ def parse_args():
 
     p.add_argument("--depth-width",  type=int, default=640)
     p.add_argument("--depth-height", type=int, default=480)
-    p.add_argument("--fps",  type=int, default=30)
+    p.add_argument("--fps",  type=int, default=15)
     p.add_argument("--port", type=int, default=6379)
     p.add_argument("--reset_cam", type=bool, default=False,
                    help="hardware reset cameras on startup to clear stale state")

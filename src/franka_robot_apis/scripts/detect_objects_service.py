@@ -167,10 +167,10 @@ class SegmentAndGraspNode:
         self.anygrasp_url  = rospy.get_param("~anygrasp_url", "ws://10.158.54.164:8767/get_saved_grasp")
 
         # --- Scene camera params ---
-        scene_rgb_topic   = rospy.get_param("~scene_rgb_topic",         "/zed/scene/color/image_raw")
-        scene_depth_topic = rospy.get_param("~scene_depth_topic",       "/zed/scene/aligned_depth_to_color/image_raw")
-        scene_info_topic  = rospy.get_param("~scene_camera_info_topic", "/zed/scene/aligned_depth_to_color/camera_info")
-        scene_frame       = rospy.get_param("~scene_camera_frame",      "zed_scene_left_optical_frame")
+        scene_rgb_topic   = rospy.get_param("~scene_rgb_topic",         "/realsense/scene/color/image_raw")
+        scene_depth_topic = rospy.get_param("~scene_depth_topic",       "/realsense/scene/aligned_depth_to_color/image_raw")
+        scene_info_topic  = rospy.get_param("~scene_camera_info_topic", "/realsense/scene/aligned_depth_to_color/camera_info")
+        scene_frame       = rospy.get_param("~scene_camera_frame",      "cam_scene_color_optical_frame")
         scene_fx = float(rospy.get_param("~scene_fx", 752.0038452148438))
         scene_fy = float(rospy.get_param("~scene_fy", 751.7178344726562))
         scene_cx = float(rospy.get_param("~scene_cx", 628.4379272460938))
@@ -472,7 +472,7 @@ class SegmentAndGraspNode:
                 Q = [q_base['x'], q_base['y'], q_base['z'], q_base['w']]
                 R = tft.quaternion_matrix(Q)[0:3, 0:3]
                 # local backward along +Z -> negative Z in local coordinates
-                shift_global = R.dot(np.array([shift_x, shift_y, -shift_z]))
+                shift_global = R.dot(np.array([shift_x, shift_y, shift_z]))
                 t_shift = [
                     float(t_base[0] + shift_global[0]),
                     float(t_base[1] + shift_global[1]),

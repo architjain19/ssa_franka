@@ -124,10 +124,10 @@ class GetObjectMaskNode:
         )
 
         # --- Scene camera params ---
-        scene_rgb_topic   = rospy.get_param("~scene_rgb_topic",         "/zed/scene/color/image_raw")
-        scene_depth_topic = rospy.get_param("~scene_depth_topic",       "/zed/scene/aligned_depth_to_color/image_raw")
-        scene_info_topic  = rospy.get_param("~scene_camera_info_topic", "/zed/scene/aligned_depth_to_color/camera_info")
-        scene_frame       = rospy.get_param("~scene_camera_frame",      "zed_scene_left_optical_frame")
+        scene_rgb_topic   = rospy.get_param("~scene_rgb_topic",         "/realsense/scene/color/image_raw")
+        scene_depth_topic = rospy.get_param("~scene_depth_topic",       "/realsense/scene/aligned_depth_to_color/image_raw")
+        scene_info_topic  = rospy.get_param("~scene_camera_info_topic", "/realsense/scene/aligned_depth_to_color/camera_info")
+        scene_frame       = rospy.get_param("~scene_camera_frame",      "cam_scene_color_optical_frame")
         scene_fx = float(rospy.get_param("~scene_fx", 752.0038452148438))
         scene_fy = float(rospy.get_param("~scene_fy", 751.7178344726562))
         scene_cx = float(rospy.get_param("~scene_cx", 628.4379272460938))

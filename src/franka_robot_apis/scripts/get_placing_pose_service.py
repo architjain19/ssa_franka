@@ -240,7 +240,7 @@ class GetPlacementPoseNode:
 
         # TF frames
         self.base_frame   = rospy.get_param("~base_frame",   "panda_link0")
-        self.camera_frame = rospy.get_param("~camera_frame", "zed_scene_left_optical_frame")
+        self.camera_frame = rospy.get_param("~camera_frame", "cam_scene_color_optical_frame")
 
         # Defaults
         self.default_init_k       = int(rospy.get_param("~init_k_val",      20))
@@ -320,6 +320,9 @@ class GetPlacementPoseNode:
                 init_k         = int(req.get("init_k_val",     self.default_init_k))
                 refine_iters   = int(req.get("n_refine_iters", self.default_refine_iters))
                 max_pc_points  = int(req.get("max_pc_points",  self.default_max_pc_pts))
+                x_offset    = float(req.get("x_offset", 0.0))
+                y_offset    = float(req.get("y_offset", 0.0))
+                z_offset    = float(req.get("z_offset", 0.0))
             except (json.JSONDecodeError, ValueError, TypeError) as e:
                 return self._fail(response, f"Bad request: {e}")
 
@@ -494,7 +497,7 @@ class GetPlacementPoseNode:
 
             # if t_base[2] < 0.0:
             #     t_base[2] = 0.0
-            t_base[2] = target_obj_height + base_obj_height*0.5 + 0.02
+            t_base[2] = target_obj_height + base_obj_height + 0.05
             rospy.loginfo(f"Adjusted Z for safety: {t_base[2]:.4f}m")
             
             # Post-multiply by 180° around X to fix AnyGrasp EE convention
@@ -505,58 +508,60 @@ class GetPlacementPoseNode:
             # q_90yz = {"x": -0.7071068, "y": 0.0, "z": 0.0, "w": 0.7071068}
             # q_base = _quaternion_multiply(q_base, q_90yz)
 
-            # # Apply a backward shift of 0.18m along the grasp pose's local X
-            # try:
-            #     shift_m = 0.18
-            #     # rotation matrix from base-frame quaternion
-            #     Q = [q_base['x'], q_base['y'], q_base['z'], q_base['w']]
-            #     BR = tft.quaternion_matrix(Q)[0:3, 0:3]
-            #     # local backward along +Z -> negative Z in local coordinates
-            #     shift_global = BR.dot(np.array([0.0, 0.0, -shift_m]))
-            #     t_shift = [
-            #         float(t_base[0] + shift_global[0]),
-            #         float(t_base[1] + shift_global[1]),
-            #         float(t_base[2] + shift_global[2]),
-            #     ]
+            try:
+                shift_x = x_offset
+                shift_y = y_offset
+                shift_z = z_offset
 
-            #     # Broadcast the shifted pose as frame 'shifted_placement' (parent = base_frame)
-            #     now = rospy.Time.now()
-            #     self._tf_broadcaster.sendTransform(
-            #         (t_shift[0], t_shift[1], t_shift[2]),
-            #         (q_base['x'], q_base['y'], q_base['z'], q_base['w']),
-            #         now,
-            #         "shifted_placement",
-            #         self.base_frame,
-            #     )
+                # rotation matrix from base-frame quaternion
+                Q = [q_base['x'], q_base['y'], q_base['z'], q_base['w']]
+                BR = tft.quaternion_matrix(Q)[0:3, 0:3]
+                # local backward along +Z -> negative Z in local coordinates
+                shift_global = BR.dot(np.array([shift_x, shift_y, shift_z]))
+                t_shift = [
+                    float(t_base[0] + shift_global[0]),
+                    float(t_base[1] + shift_global[1]),
+                    float(t_base[2] + shift_global[2]),
+                ]
 
-            #     # small pause to allow TF to propagate, then lookup shifted pose
-            #     rospy.sleep(0.05)
-            #     self._tf_listener.waitForTransform(
-            #         self.base_frame,
-            #         "shifted_placement",
-            #         rospy.Time(0),
-            #         rospy.Duration(self.tf_timeout_sec),
-            #     )
-            #     trans_s, rot_s = self._tf_listener.lookupTransform(
-            #         self.base_frame,
-            #         "shifted_placement",
-            #         rospy.Time(0),
-            #     )
+                # Broadcast the shifted pose as frame 'shifted_placement' (parent = base_frame)
+                now = rospy.Time.now()
+                self._tf_broadcaster.sendTransform(
+                    (t_shift[0], t_shift[1], t_shift[2]),
+                    (q_base['x'], q_base['y'], q_base['z'], q_base['w']),
+                    now,
+                    "shifted_placement",
+                    self.base_frame,
+                )
 
-            #     t_base = [float(trans_s[0]), float(trans_s[1]), float(trans_s[2])]
-            #     q_base = {"x": float(rot_s[0]), "y": float(rot_s[1]),
-            #               "z": float(rot_s[2]), "w": float(rot_s[3])}
+                # small pause to allow TF to propagate, then lookup shifted pose
+                rospy.sleep(0.05)
+                self._tf_listener.waitForTransform(
+                    self.base_frame,
+                    "shifted_placement",
+                    rospy.Time(0),
+                    rospy.Duration(self.tf_timeout_sec),
+                )
+                trans_s, rot_s = self._tf_listener.lookupTransform(
+                    self.base_frame,
+                    "shifted_placement",
+                    rospy.Time(0),
+                )
 
-            #     rospy.loginfo(
-            #         f"Shifted pose in '{self.base_frame}' | "
-            #         f"xyz=({t_base[0]:.4f}, {t_base[1]:.4f}, {t_base[2]:.4f})  "
-            #         f"quat=({q_base['x']:.4f}, {q_base['y']:.4f}, "
-            #         f"{q_base['z']:.4f}, {q_base['w']:.4f})"
-            #     )
+                t_base = [float(trans_s[0]), float(trans_s[1]), float(trans_s[2])]
+                q_base = {"x": float(rot_s[0]), "y": float(rot_s[1]),
+                          "z": float(rot_s[2]), "w": float(rot_s[3])}
 
-            # except Exception as e:
-            #     rospy.logwarn(f"Failed to apply/lookup shifted placement TF: {e}")
-            #     # keep original t_base/q_base if shifting fails
+                rospy.loginfo(
+                    f"Shifted pose in '{self.base_frame}' | "
+                    f"xyz=({t_base[0]:.4f}, {t_base[1]:.4f}, {t_base[2]:.4f})  "
+                    f"quat=({q_base['x']:.4f}, {q_base['y']:.4f}, "
+                    f"{q_base['z']:.4f}, {q_base['w']:.4f})"
+                )
+
+            except Exception as e:
+                rospy.logwarn(f"Failed to apply/lookup shifted placement TF: {e}")
+                # keep original t_base/q_base if shifting fails
 
 
             rospy.loginfo(
