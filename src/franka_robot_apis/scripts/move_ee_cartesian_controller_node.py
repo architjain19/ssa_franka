@@ -475,9 +475,9 @@ class MoveEEControllerNode:
                 return response
             
             try:
-                if target_pose["position"]["z"] > 0.8:
-                    rospy.logwarn("Target position z is too high. Capping to 0.8m to avoid unsafe trajectories.")
-                    target_pose["position"]["z"] = 0.8
+                if target_pose["position"]["z"] > 0.7:
+                    rospy.logwarn("Target position z is too high. Capping to 0.7m to avoid unsafe trajectories.")
+                    target_pose["position"]["z"] = 0.7
             except Exception as e:
                 rospy.logwarn(f"Error checking/capping target z: {e}")
                 response.result_code.result_code = ResultCode.INVALID_INPUT

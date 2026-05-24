@@ -86,7 +86,7 @@ DEFAULT_MAX_WIDTH_M       = 0.085   # metres at rPR = 0   (open,   2F-85)
 DEFAULT_MIN_WIDTH_M       = 0.000   # metres at rPR = 255 (closed, 2F-85)
 DEFAULT_SPEED             = 190     # rSP: 0 (slow) - 255 (fast)
 DEFAULT_FORCE             = 150     # rFR: 0 (light) - 255 (max)
-DEFAULT_DURATION          = 3.0     # seconds to wait for motion completion
+DEFAULT_DURATION          = 7.0     # seconds to wait for motion completion
 DEFAULT_POSITION_TOL_PR   = 5       # ±rPR counts to accept as "reached"
 
 
@@ -499,7 +499,7 @@ class SetGripperWidthNode:
         Returns:
             tuple: (status_string, final_pr_int)
         """
-        MOTION_START_TIMEOUT = 0.5   # seconds to wait for gOBJ==0
+        MOTION_START_TIMEOUT = 2.0   # seconds to wait for gOBJ==0
         POLL_INTERVAL        = 0.05  # 20 Hz
 
         overall_deadline  = time.time() + duration_seconds
