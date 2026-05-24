@@ -473,6 +473,17 @@ class MoveEEControllerNode:
                 response.result_code.message     = f"Bad target pose: {e}"
                 response.data = json.dumps({"success": False, "error": str(e)})
                 return response
+            
+            try:
+                if target_pose["position"]["z"] > 0.8:
+                    rospy.logwarn("Target position z is too high. Capping to 0.8m to avoid unsafe trajectories.")
+                    target_pose["position"]["z"] = 0.8
+            except Exception as e:
+                rospy.logwarn(f"Error checking/capping target z: {e}")
+                response.result_code.result_code = ResultCode.INVALID_INPUT
+                response.result_code.message     = f"Error checking/capping target z: {e}"
+                response.data = json.dumps({"success": False, "error": str(e)})
+                return response
 
             if not self.has_received_data:
                 response.result_code.result_code = ResultCode.SERVICE_NOT_RUNNING
