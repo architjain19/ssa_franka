@@ -25,6 +25,7 @@ Example service requests:
   rosservice call /robot/control/reset_robot "{}"
 """
 
+import copy
 import json
 import math
 import time
@@ -646,6 +647,11 @@ class MoveEEControllerNode:
                         },
                         "orientation": ori_dicts[idx],
                     }
+                    if pose_dict["position"]["z"] <= 0.19:
+                        # if orientation is top-down (x near ±1) and (w near 0)
+                        if abs(pose_dict["orientation"]["x"]) > 0.9 and abs(pose_dict["orientation"]["w"]) < 0.1:
+                            rospy.logwarn(f"CAPPING Z to 0.19m to avoid unsafe trajectory at waypoint {idx}")
+                            pose_dict["position"]["z"] = 0.19
                     self.pose_pub.publish(self._create_pose_stamped(pose_dict))
                     last_published_pose = pose_dict
 
@@ -672,6 +678,10 @@ class MoveEEControllerNode:
                 # Publish freeze pose several times to make sure the
                 # impedance controller latches onto it.
                 for _ in range(5):
+                    if freeze_pose["position"]["z"] <= 0.19:
+                        if abs(freeze_pose["orientation"]["x"]) > 0.9 and abs(freeze_pose["orientation"]["w"]) < 0.1:
+                            rospy.logwarn(f"CAPPING Z to 0.19m to avoid unsafe trajectory at waypoint {idx}")
+                            freeze_pose["position"]["z"] = 0.19
                     self.pose_pub.publish(self._create_pose_stamped(freeze_pose))
                     rospy.sleep(0.02)
 
@@ -714,6 +724,10 @@ class MoveEEControllerNode:
                     "orientation": cur_pose_now["orientation"],
                 }
                 for _ in range(5):
+                    if freeze_pose["position"]["z"] <= 0.19:
+                        if abs(freeze_pose["orientation"]["x"]) > 0.9 and abs(freeze_pose["orientation"]["w"]) < 0.1:
+                            rospy.logwarn(f"CAPPING Z to 0.19m to avoid unsafe trajectory at waypoint {idx}")
+                            freeze_pose["position"]["z"] = 0.19
                     self.pose_pub.publish(self._create_pose_stamped(freeze_pose))
                     rospy.sleep(0.02)
 
@@ -758,8 +772,7 @@ class MoveEEControllerNode:
             else:
                 response.result_code.result_code = ResultCode.TIMEOUT
                 response.result_code.message     = (
-                    f"EE did not converge within "
-                    f"{self.traj_buffer + self.ee_convergence_timeout:.1f}s"
+                    f"IK convergence timeout after {convergence_elapsed:.2f}s while waiting for EE to reach target pose"
                 )
                 cur_pose_now = self._get_current_pose_dict() or current_ee_pose
                 response.data = json.dumps({
@@ -909,7 +922,7 @@ class MoveEEControllerNode:
             data = data["trajectory"]
 
         if "waypoints" not in data:
-            return None, "Trajectory JSON missing 'waypoints' field"
+            return None, "Failed to solve IK"
 
         return data, None
 
@@ -932,60 +945,6 @@ class MoveEEControllerNode:
                         f"{jump:.4f}m (tolerance={self.position_jump_tolerance}m)"
                     )
         return True, None
-
-    # =========================================================================
-    # Core blocking movement — used by reset
-    # =========================================================================
-
-    def _execute_move_to_pose(self, target_pose):
-        """
-        Publish *target_pose* continuously until the EE arrives within tolerance
-        or the timeout expires. Acquires _traj_lock to prevent concurrent moves.
-        Returns a RobotCommandResponse.
-        """
-        response = RobotCommandResponse()
-
-        if not self._traj_lock.acquire(blocking=False):
-            response.result_code.result_code = ResultCode.FAILURE
-            response.result_code.message     = "Another motion is already in progress."
-            response.data = json.dumps({"success": False, "error": "Motion in progress"})
-            return response
-
-        try:
-            start_time = rospy.Time.now()
-            rate       = rospy.Rate(self.publish_rate)
-
-            tx = target_pose["position"]["x"]
-            ty = target_pose["position"]["y"]
-            tz = target_pose["position"]["z"]
-            rospy.loginfo(f"Moving to: ({tx:.3f}, {ty:.3f}, {tz:.3f})")
-
-            while not rospy.is_shutdown():
-                elapsed = (rospy.Time.now() - start_time).to_sec()
-
-                if elapsed > self.execution_timeout:
-                    response.result_code.result_code = ResultCode.TIMEOUT
-                    response.result_code.message     = f"Timeout after {elapsed:.1f}s"
-                    response.data = json.dumps({"success": False, "error": "Timeout", "elapsed": elapsed})
-                    return response
-
-                if self._check_at_target(target_pose):
-                    rospy.loginfo(f"Reached target in {elapsed:.1f}s")
-                    response.result_code.result_code = ResultCode.SUCCESS
-                    response.result_code.message     = "Target reached"
-                    response.data = json.dumps({"success": True, "elapsed_time": elapsed})
-                    return response
-
-                self.pose_pub.publish(self._create_pose_stamped(target_pose))
-                rate.sleep()
-
-            response.result_code.result_code = ResultCode.FAILURE
-            response.result_code.message     = "Service interrupted"
-            response.data = json.dumps({"success": False, "error": "Interrupted"})
-            return response
-
-        finally:
-            self._traj_lock.release()
 
     # =========================================================================
     # Convergence polling — used after WebSocket trajectory publishing
@@ -1012,6 +971,13 @@ class MoveEEControllerNode:
         t_start    = time.time()
         timeout_at = t_start + self.traj_buffer + self.ee_convergence_timeout
         poll_dt    = 0.05  # 20 Hz
+
+        # compensate for capping z <0.19m to avoid unsafe trajectories
+        if target_pose["position"]["z"] < 0.19:
+            if abs(target_pose["orientation"]["x"]) > 0.9 and abs(target_pose["orientation"]["w"]) < 0.1:
+                rospy.logwarn(f"Convergence check: CAPPING target Z to 0.19m to avoid unsafe trajectory")
+                target_pose = copy.deepcopy(target_pose)
+                target_pose["position"]["z"] = 0.19
 
         prev_pos      = None
         prev_t        = None
