@@ -33,10 +33,29 @@ import asyncio
 import threading
 import traceback
 import rospy
+import actionlib
 from geometry_msgs.msg import PoseStamped, WrenchStamped
 from robot_api_interfaces.srv import RobotCommand, RobotCommandResponse, RobotQuery, RobotQueryResponse
 from robot_api_interfaces.msg import ResultCode
 from franka_msgs.msg import FrankaState
+
+# ErrorRecoveryAction has moved between franka_msgs.msg and franka_control.msg
+# in various franka_ros versions; try both.
+try:
+    from franka_msgs.msg import ErrorRecoveryAction, ErrorRecoveryGoal
+    _ERROR_RECOVERY_OK = True
+except ImportError:
+    try:
+        from franka_control.msg import ErrorRecoveryAction, ErrorRecoveryGoal
+        _ERROR_RECOVERY_OK = True
+    except ImportError:
+        _ERROR_RECOVERY_OK = False
+        ErrorRecoveryAction = None
+        ErrorRecoveryGoal   = None
+        rospy.logwarn_once(
+            "ErrorRecoveryAction not importable from franka_msgs or "
+            "franka_control. Reflex auto-recovery will be disabled."
+        )
 
 try:
     import aiohttp
@@ -76,16 +95,16 @@ class MoveEEControllerNode:
         self.settle_velocity_threshold = float(rospy.get_param("~settle_velocity_threshold", 0.005))   # m/s
         self.settle_position_tolerance = float(rospy.get_param("~settle_position_tolerance", 0.025))   # m, looser
         self.settle_samples            = int(rospy.get_param("~settle_samples", 5))
-        
+
         # Service timeouts
         self.ee_pose_svc_timeout      = float(rospy.get_param("~ee_pose_svc_timeout", 5.0))
         self.current_joints_svc_timeout = float(rospy.get_param("~current_joints_svc_timeout", 5.0))
 
         # ===== Guarded Move Parameters =====
         self.default_force_threshold = {
-            "x": float(rospy.get_param("~default_force_threshold_x", 4.0)),
-            "y": float(rospy.get_param("~default_force_threshold_y", 4.0)),
-            "z": float(rospy.get_param("~default_force_threshold_z", 4.0)),
+            "x": float(rospy.get_param("~default_force_threshold_x", 6.0)),
+            "y": float(rospy.get_param("~default_force_threshold_y", 6.0)),
+            "z": float(rospy.get_param("~default_force_threshold_z", 6.0)),
         }
         self.guard_force_frame = str(
             rospy.get_param("~guard_force_frame", "ee")
@@ -95,6 +114,22 @@ class MoveEEControllerNode:
                 f"Invalid guard_force_frame '{self.guard_force_frame}', defaulting to 'ee'"
             )
             self.guard_force_frame = "ee"
+
+        # ===== Error Recovery Parameters =====
+        # Automatic reflex recovery: when the robot enters REFLEX mode
+        # (e.g. cartesian_reflex from contact), we publish the current EE
+        # pose as the new equilibrium, then call /franka_control/error_recovery
+        # so the impedance controller can resume without a script restart.
+        self.error_recovery_action_name = rospy.get_param(
+            "~error_recovery_action", "/franka_control/error_recovery"
+        )
+        self.auto_recover_reflex   = bool(rospy.get_param("~auto_recover_reflex", True))
+        self.reflex_cooldown_s     = float(rospy.get_param("~reflex_cooldown_s", 0.5))
+        self.error_recovery_timeout = float(rospy.get_param("~error_recovery_timeout", 5.0))
+        # franka_msgs RobotMode constants:
+        #   0 OTHER, 1 IDLE, 2 MOVE, 3 GUIDING, 4 REFLEX, 5 USER_STOPPED, 6 AUTOMATIC_ERROR_RECOVERY
+        self.ROBOT_MODE_REFLEX                 = 4
+        self.ROBOT_MODE_AUTOMATIC_ERROR_RECOVERY = 6
 
         # Publisher
         self.pose_pub = rospy.Publisher(
@@ -112,6 +147,40 @@ class MoveEEControllerNode:
             "/franka_state_controller/F_ext", WrenchStamped,
             self._fext_callback, queue_size=1,
         )
+
+        # ===== Reflex Recovery State =====
+        # Track latest robot_mode reported by franka_state_controller and
+        # whether a reflex occurred in this process's lifetime (so the active
+        # trajectory loop can notice it and respond).
+        self.latest_robot_mode      = None      # int, see ROBOT_MODE_* above
+        self.reflex_count           = 0         # monotonic count of REFLEX entries seen
+        self._last_reflex_event_t   = None      # wall-clock time of last REFLEX entry
+        self._last_recovery_attempt = 0.0       # wall-clock time of last recovery action send
+        self._reflex_lock           = threading.Lock()
+
+        # ErrorRecovery action client. Don't block init if the action server
+        # isn't up yet — we retry on each call.
+        self._error_recovery_client = None
+        if _ERROR_RECOVERY_OK:
+            self._error_recovery_client = actionlib.SimpleActionClient(
+                self.error_recovery_action_name, ErrorRecoveryAction
+            )
+            rospy.loginfo(
+                f"Waiting briefly for error_recovery action server at "
+                f"'{self.error_recovery_action_name}' ..."
+            )
+            if not self._error_recovery_client.wait_for_server(rospy.Duration(2.0)):
+                rospy.logwarn(
+                    f"Error-recovery action server '{self.error_recovery_action_name}' "
+                    f"not available yet — will retry when needed."
+                )
+            else:
+                rospy.loginfo("Error-recovery action server connected.")
+        else:
+            rospy.logwarn(
+                "Reflex auto-recovery disabled (ErrorRecoveryAction import failed)."
+            )
+            self.auto_recover_reflex = False
 
         # ===== Service Proxies =====
         _ee_svc = "/robot/proprioception/get_current_ee_pose"
@@ -159,6 +228,7 @@ class MoveEEControllerNode:
         rospy.Service("/robot/control/move_ee_to_rel_pose", RobotCommand, self._handle_move_ee_to_rel_pose)
         rospy.Service("/robot/control/move_ee_guarded",     RobotCommand, self._handle_move_ee_guarded)
         rospy.Service("/robot/control/reset_robot",         RobotQuery,   self._handle_reset_robot)
+        rospy.Service("/robot/control/recover_from_reflex", RobotQuery,   self._handle_recover_from_reflex)
 
         rospy.loginfo(
             f"MoveEEControllerNode ready.\n"
@@ -166,6 +236,7 @@ class MoveEEControllerNode:
             f"  /robot/control/move_ee_to_rel_pose\n"
             f"  /robot/control/move_ee_guarded\n"
             f"  /robot/control/reset_robot\n"
+            f"  /robot/control/recover_from_reflex\n"
             f"  equilibrium_pose_topic : {self.equilibrium_pose_topic}\n"
             f"  ws                     : ws://{self.ws_host}:{self.ws_port}/ws\n"
             f"  time_scale             : {self.time_scale}x\n"
@@ -176,7 +247,9 @@ class MoveEEControllerNode:
             f"  settle_pos_tol         : {self.settle_position_tolerance} m\n"
             f"  settle_samples         : {self.settle_samples}\n"
             f"  guard_force_thresholds : {self.default_force_threshold} N\n"
-            f"  guard_force_frame      : {self.guard_force_frame}"
+            f"  guard_force_frame      : {self.guard_force_frame}\n"
+            f"  auto_recover_reflex    : {self.auto_recover_reflex}\n"
+            f"  reflex_cooldown_s      : {self.reflex_cooldown_s}"
         )
 
     # =========================================================================
@@ -184,8 +257,37 @@ class MoveEEControllerNode:
     # =========================================================================
 
     def _robot_state_callback(self, msg):
-        self.latest_o_tee     = msg.O_T_EE
+        self.latest_o_tee      = msg.O_T_EE
         self.has_received_data = True
+
+        # ---- robot_mode tracking & reflex watchdog ----
+        try:
+            mode = int(msg.robot_mode)
+        except (TypeError, ValueError, AttributeError):
+            return
+        prev_mode = self.latest_robot_mode
+        self.latest_robot_mode = mode
+
+        # Detect entering REFLEX. Use a lock to avoid duplicate increments
+        # from rapid callbacks while we're already handling one.
+        if mode == self.ROBOT_MODE_REFLEX and prev_mode != self.ROBOT_MODE_REFLEX:
+            with self._reflex_lock:
+                self.reflex_count        += 1
+                self._last_reflex_event_t = time.time()
+                rospy.logwarn(
+                    f"[ReflexWatchdog] REFLEX entered "
+                    f"(event #{self.reflex_count}). prev_mode={prev_mode}"
+                )
+
+            if self.auto_recover_reflex:
+                # Don't block the franka_states callback — kick off recovery
+                # in a separate thread.
+                t = threading.Thread(
+                    target=self._auto_recover_thread,
+                    name="reflex-auto-recover",
+                    daemon=True,
+                )
+                t.start()
 
     def _fext_callback(self, msg):
         f = msg.wrench.force
@@ -208,9 +310,6 @@ class MoveEEControllerNode:
     def _get_current_pose_dict(self):
         """
         Return current EE pose as a dict from O_T_EE (FrankaState topic).
-        Converts the 4×4 column-major transform to position + quaternion
-        using Shepperd's method with normalization and canonicalization.
-        Returns None if robot state has not been received yet.
         """
         if self.latest_o_tee is None:
             return None
@@ -219,11 +318,10 @@ class MoveEEControllerNode:
         cy = self.latest_o_tee[13]
         cz = self.latest_o_tee[14]
 
-        # Column-major O_T_EE  ->  row-major rotation submatrix
         r = [
-            self.latest_o_tee[0], self.latest_o_tee[4], self.latest_o_tee[8],   # R[0,0], R[0,1], R[0,2]
-            self.latest_o_tee[1], self.latest_o_tee[5], self.latest_o_tee[9],   # R[1,0], R[1,1], R[1,2]
-            self.latest_o_tee[2], self.latest_o_tee[6], self.latest_o_tee[10],  # R[2,0], R[2,1], R[2,2]
+            self.latest_o_tee[0], self.latest_o_tee[4], self.latest_o_tee[8],
+            self.latest_o_tee[1], self.latest_o_tee[5], self.latest_o_tee[9],
+            self.latest_o_tee[2], self.latest_o_tee[6], self.latest_o_tee[10],
         ]
 
         trace = r[0] + r[4] + r[8]
@@ -258,15 +356,9 @@ class MoveEEControllerNode:
         }
 
     def _ensure_quaternion_continuity(self, waypoints_ori_dicts):
-        """
-        Enforce quaternion sign consistency across the trajectory so the
-        controller's SLERP always takes the short arc.
-        Each entry is a dict {x, y, z, w}.
-        """
         result = []
         for i, q in enumerate(waypoints_ori_dicts):
             if i == 0:
-                # Align first waypoint to the robot's current orientation
                 current = self._get_current_pose_dict()
                 if current is not None:
                     ref = current["orientation"]
@@ -275,7 +367,6 @@ class MoveEEControllerNode:
                     if dot < 0:
                         q = {k: -v for k, v in q.items()}
             else:
-                # Align to the previous waypoint to avoid mid-trajectory flips
                 prev = result[-1]
                 dot = (prev["w"]*q["w"] + prev["x"]*q["x"] +
                     prev["y"]*q["y"] + prev["z"]*q["z"])
@@ -285,7 +376,6 @@ class MoveEEControllerNode:
         return result
 
     def _check_at_target(self, target):
-        """Return True when position error is within tolerance."""
         if self.latest_o_tee is None:
             return False
         cx = self.latest_o_tee[12]
@@ -297,17 +387,218 @@ class MoveEEControllerNode:
         return math.sqrt(dx**2 + dy**2 + dz**2) <= self.position_tolerance
 
     # =========================================================================
+    # Reflex / Error Recovery
+    # =========================================================================
+
+    def _freeze_equilibrium_pose_here(self, n_publishes=8, sleep_s=0.02):
+        """
+        Publish the *current* EE pose as the equilibrium pose several times so
+        the impedance controller stops pulling toward the old equilibrium
+        (which is what caused the reflex). Returns the pose dict that was
+        published, or None if pose data isn't available.
+        """
+        cur = self._get_current_pose_dict()
+        if cur is None:
+            rospy.logwarn(
+                "[ReflexRecovery] Cannot freeze equilibrium — no EE pose data."
+            )
+            return None
+        freeze_pose = {
+            "position":    dict(cur["position"]),
+            "orientation": dict(cur["orientation"]),
+        }
+        # Same z-cap safety used elsewhere
+        if freeze_pose["position"]["z"] <= 0.19:
+            if (abs(freeze_pose["orientation"]["x"]) > 0.9 and
+                    abs(freeze_pose["orientation"]["w"]) < 0.1):
+                freeze_pose["position"]["z"] = 0.19
+
+        for _ in range(n_publishes):
+            try:
+                self.pose_pub.publish(self._create_pose_stamped(freeze_pose))
+            except Exception as e:
+                rospy.logwarn(f"[ReflexRecovery] freeze publish failed: {e}")
+                break
+            rospy.sleep(sleep_s)
+        return freeze_pose
+
+    def _send_error_recovery(self, wait=True):
+        """
+        Send a goal to /franka_control/error_recovery (or whatever
+        ~error_recovery_action is set to). Returns (success: bool, msg: str).
+
+        wait=True blocks for up to self.error_recovery_timeout seconds for
+        the action server to finish. wait=False returns immediately after
+        sending the goal.
+        """
+        client = self._error_recovery_client
+        if client is None:
+            return False, "Error-recovery client not available (import failed)"
+        if not client.wait_for_server(rospy.Duration(1.0)):
+            return False, (
+                f"Error-recovery action server "
+                f"'{self.error_recovery_action_name}' not available"
+            )
+
+        try:
+            client.send_goal(ErrorRecoveryGoal())
+        except Exception as e:
+            return False, f"send_goal failed: {e}"
+
+        if not wait:
+            return True, "Recovery goal sent (no wait)"
+
+        finished = client.wait_for_result(rospy.Duration(self.error_recovery_timeout))
+        if not finished:
+            return False, (
+                f"Error-recovery did not complete within "
+                f"{self.error_recovery_timeout}s"
+            )
+
+        state = client.get_state()
+        # actionlib.GoalStatus.SUCCEEDED = 3
+        if state == actionlib.GoalStatus.SUCCEEDED:
+            return True, "Error recovery succeeded"
+        else:
+            return False, (
+                f"Error recovery finished with non-success state {state}"
+            )
+
+    def _auto_recover_thread(self):
+        """
+        Background-thread worker that the franka_states callback spawns when
+        REFLEX is detected. Freezes the equilibrium pose at the current EE
+        position, then calls the error-recovery action. Honors a cooldown
+        so we don't spam recovery requests.
+        """
+        try:
+            with self._reflex_lock:
+                now = time.time()
+                if (now - self._last_recovery_attempt) < self.reflex_cooldown_s:
+                    rospy.logwarn(
+                        f"[ReflexWatchdog] Skipping auto-recover "
+                        f"(cooldown {self.reflex_cooldown_s}s active)."
+                    )
+                    return
+                self._last_recovery_attempt = now
+
+            rospy.logwarn(
+                "[ReflexWatchdog] Auto-recovering from REFLEX: freezing "
+                "equilibrium pose, then calling error_recovery action."
+            )
+            self._freeze_equilibrium_pose_here()
+
+            ok, msg = self._send_error_recovery(wait=True)
+            if ok:
+                rospy.loginfo(f"[ReflexWatchdog] Recovery OK: {msg}")
+                # Re-publish freeze pose once more so the restarted
+                # controller picks it up immediately.
+                self._freeze_equilibrium_pose_here(n_publishes=3, sleep_s=0.02)
+            else:
+                rospy.logerr(f"[ReflexWatchdog] Recovery FAILED: {msg}")
+        except Exception:
+            rospy.logerr(
+                f"[ReflexWatchdog] Unhandled exception:\n{traceback.format_exc()}"
+            )
+
+    def _has_unhandled_reflex_since(self, t_start):
+        """
+        Return (occurred: bool, event_time: float|None). True if any REFLEX
+        event was observed at-or-after wall-clock time t_start.
+        """
+        evt = self._last_reflex_event_t
+        if evt is None:
+            return False, None
+        return (evt >= t_start), evt
+
+    def _maybe_override_with_reflex(self, response, t_total_start, target_pose_for_logs=None):
+        """
+        If a REFLEX event occurred during this trajectory (i.e. at or after
+        t_total_start), wait briefly for the auto-recovery thread to clear
+        it, then rewrite the service response as:
+
+          result_code  : SUCCESS
+          data.stop_reason   : "reflex_recovered" (if recovery cleared mode)
+                               or "reflex"        (if still in REFLEX)
+          data.contact_stopped : True
+          data.reflex_event_time : wall-clock timestamp of the reflex
+          data.robot_mode_after  : robot_mode after our wait window
+
+        If no reflex was observed since t_total_start, the response is
+        returned unchanged.
+        """
+        occurred, evt_t = self._has_unhandled_reflex_since(t_total_start)
+        if not occurred:
+            return response
+
+        rospy.logwarn(
+            f"[ReflexOverride] Reflex event detected during trajectory "
+            f"(event_t={evt_t:.3f}, t_start={t_total_start:.3f}). "
+            f"Waiting for recovery to clear..."
+        )
+
+        # Wait for auto-recovery to bring us out of REFLEX, bounded by
+        # error_recovery_timeout plus a small slack. The watchdog thread is
+        # already running (or has finished); we just observe robot_mode.
+        deadline = time.time() + self.error_recovery_timeout + 1.0
+        while time.time() < deadline and not rospy.is_shutdown():
+            if (self.latest_robot_mode is not None and
+                    self.latest_robot_mode != self.ROBOT_MODE_REFLEX and
+                    self.latest_robot_mode != self.ROBOT_MODE_AUTOMATIC_ERROR_RECOVERY):
+                break
+            time.sleep(0.05)
+
+        cur_pose_now = self._get_current_pose_dict()
+        if cur_pose_now is None:
+            cur_pose_now = {"position": {"x": 0.0, "y": 0.0, "z": 0.0},
+                            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}}
+
+        recovered = (self.latest_robot_mode is not None and
+                     self.latest_robot_mode != self.ROBOT_MODE_REFLEX)
+        stop_reason = "reflex_recovered" if recovered else "reflex"
+
+        total_elapsed = time.time() - t_total_start
+        msg = (
+            f"Cartesian reflex during trajectory; "
+            f"{'auto-recovered' if recovered else 'still in REFLEX'}."
+        )
+        rospy.logwarn(f"[ReflexOverride] {msg}")
+
+        # Try to extract any existing data block from the response.data JSON,
+        # so we preserve diagnostic fields the caller might rely on.
+        existing = {}
+        try:
+            existing = json.loads(response.data) if response.data else {}
+        except (TypeError, ValueError):
+            existing = {}
+        existing_data = existing.get("data", {})
+        if not isinstance(existing_data, dict):
+            existing_data = {}
+
+        # Build the new payload
+        data_block = dict(existing_data)
+        data_block["stop_reason"]      = stop_reason
+        data_block["stop_position"]    = dict(cur_pose_now["position"])
+        data_block["elapsed"]          = round(total_elapsed, 3)
+        data_block["contact_stopped"]  = True
+        data_block["reflex_event_time"] = round(evt_t, 3)
+        data_block["robot_mode_after"]  = self.latest_robot_mode
+        data_block["reflex_count"]      = self.reflex_count
+
+        response.result_code.result_code = ResultCode.SUCCESS
+        response.result_code.message     = msg
+        response.data = json.dumps({
+            "success":      False,
+            "message":      msg,
+            "elapsed_time": round(total_elapsed, 3),
+            "data":         data_block,
+        })
+        return response
+
+    # =========================================================================
     # Quaternion helpers
     # =========================================================================
     def _apply_gripper_shift(self, target_pose, shift_m):
-        """
-        Shift target_pose backward along its OWN local -Z axis by `shift_m`.
-        Orientation is unchanged. Returns a new pose dict.
-
-        Equivalent to the TF-based "shifted_placement" trick: rotate
-        (0, 0, -shift_m) by the target orientation to express the shift in
-        the base frame, then add to the target position.
-        """
         if shift_m == 0.0:
             return target_pose
 
@@ -325,10 +616,6 @@ class MoveEEControllerNode:
         }
 
     def _normalize_quaternion(self, q):
-        """
-        Normalize to unit length and canonicalize so w >= 0.
-        Falls back to identity quaternion if the norm is near zero.
-        """
         qx, qy, qz, qw = float(q["x"]), float(q["y"]), float(q["z"]), float(q["w"])
         norm = math.sqrt(qx**2 + qy**2 + qz**2 + qw**2)
         if norm < 1e-10:
@@ -340,19 +627,6 @@ class MoveEEControllerNode:
         return {"x": qx, "y": qy, "z": qz, "w": qw}
 
     def _rotate_vector_by_quaternion(self, vec, quat):
-        """
-        Rotate a 3D vector by a unit quaternion (active rotation).
-
-        Given the EE orientation quaternion q (base -> EE), this maps a
-        vector expressed in the EE frame to its components in the base frame:
-            v_base = R(q) * v_ee
-        so e.g. (0, 0, 0.1) in the EE frame becomes a 10 cm step along the
-        gripper's approach axis expressed in base coordinates.
-
-        vec : dict {x,y,z} or sequence of length 3
-        quat: dict {x,y,z,w}
-        Returns: dict {x,y,z}
-        """
         qn = self._normalize_quaternion(quat)
         qx, qy, qz, qw = qn["x"], qn["y"], qn["z"], qn["w"]
 
@@ -361,7 +635,6 @@ class MoveEEControllerNode:
         else:
             vx, vy, vz = float(vec[0]), float(vec[1]), float(vec[2])
 
-        # Standard quaternion-to-rotation-matrix (q = w + xi + yj + zk)
         r00 = 1.0 - 2.0 * (qy*qy + qz*qz)
         r01 = 2.0 * (qx*qy - qw*qz)
         r02 = 2.0 * (qx*qz + qw*qy)
@@ -379,16 +652,6 @@ class MoveEEControllerNode:
         }
 
     def _rotate_vector_by_quaternion_inverse(self, vec, quat):
-        """
-        Apply the INVERSE rotation: maps a vector expressed in the base frame
-        into the EE frame. For unit quaternions, R^-1 = R^T, so we transpose
-        the rotation matrix.
-
-            v_ee = R(q)^T * v_base
-
-        Useful for transforming the base-frame F_ext into the EE frame so we
-        can check forces along the gripper's local axes.
-        """
         qn = self._normalize_quaternion(quat)
         qx, qy, qz, qw = qn["x"], qn["y"], qn["z"], qn["w"]
 
@@ -397,15 +660,14 @@ class MoveEEControllerNode:
         else:
             vx, vy, vz = float(vec[0]), float(vec[1]), float(vec[2])
 
-        # Transposed rotation matrix (i.e. inverse rotation for unit quats)
         r00 = 1.0 - 2.0 * (qy*qy + qz*qz)
-        r10 = 2.0 * (qx*qy - qw*qz)   # was r01
-        r20 = 2.0 * (qx*qz + qw*qy)   # was r02
-        r01 = 2.0 * (qx*qy + qw*qz)   # was r10
+        r10 = 2.0 * (qx*qy - qw*qz)
+        r20 = 2.0 * (qx*qz + qw*qy)
+        r01 = 2.0 * (qx*qy + qw*qz)
         r11 = 1.0 - 2.0 * (qx*qx + qz*qz)
-        r21 = 2.0 * (qy*qz - qw*qx)   # was r12
-        r02 = 2.0 * (qx*qz - qw*qy)   # was r20
-        r12 = 2.0 * (qy*qz + qw*qx)   # was r21
+        r21 = 2.0 * (qy*qz - qw*qx)
+        r02 = 2.0 * (qx*qz - qw*qy)
+        r12 = 2.0 * (qy*qz + qw*qx)
         r22 = 1.0 - 2.0 * (qx*qx + qy*qy)
 
         return {
@@ -422,31 +684,6 @@ class MoveEEControllerNode:
         """
         Core blocking trajectory execution shared by the absolute, relative,
         and guarded move services.
-
-        Validates the target, requests a trajectory from the motion server
-        via WebSocket, performs safety checks, publishes waypoints with
-        scaled timing, and polls for EE convergence.
-
-        Acquires _traj_lock so it cannot run concurrently with itself or
-        with `_execute_move_to_pose`.
-
-        Parameters
-        ----------
-        target_pose : dict
-            {"position": {x,y,z}, "orientation": {x,y,z,w}}
-        guard_callback : callable or None
-            Optional callable invoked once per published waypoint AND once per
-            convergence-poll iteration. Signature: () -> (triggered: bool,
-            payload: dict). If it returns triggered=True the trajectory is
-            aborted, the equilibrium pose is frozen at the current EE pose,
-            and the response carries:
-              result_code : SUCCESS (guard tripping is a valid outcome)
-              data["data"] : whatever the callback put in ``payload`` plus
-                             {"stop_reason": "guard_triggered", "stop_position": {...}}
-
-        Returns
-        -------
-        RobotCommandResponse
         """
         response = RobotCommandResponse()
 
@@ -456,12 +693,10 @@ class MoveEEControllerNode:
             response.data = json.dumps({"success": False, "error": "Motion in progress"})
             return response
 
-        # Reset cancellation state for this run
         self._cancel_event.clear()
         try:
             t_total_start = time.time()
 
-            # Validate target pose values (cheap sanity check on caller)
             try:
                 for a in ["x", "y", "z"]:
                     if not isinstance(target_pose["position"][a], (int, float)):
@@ -474,7 +709,7 @@ class MoveEEControllerNode:
                 response.result_code.message     = f"Bad target pose: {e}"
                 response.data = json.dumps({"success": False, "error": str(e)})
                 return response
-            
+
             try:
                 if target_pose["position"]["z"] > 0.7:
                     rospy.logwarn("Target position z is too high. Capping to 0.7m to avoid unsafe trajectories.")
@@ -492,7 +727,6 @@ class MoveEEControllerNode:
                 response.data = json.dumps({"success": False, "error": "Robot not connected"})
                 return response
 
-            # ---- Get current state ----
             current_joints = self._get_current_joints()
             if current_joints is None:
                 response.result_code.result_code = ResultCode.FAILURE
@@ -516,7 +750,6 @@ class MoveEEControllerNode:
                 f"{target_pose['position']['z']:.3f})"
             )
 
-            # ---- Sanity-check target distance ----
             dx = current_ee_pose["position"]["x"] - target_pose["position"]["x"]
             dy = current_ee_pose["position"]["y"] - target_pose["position"]["y"]
             dz = current_ee_pose["position"]["z"] - target_pose["position"]["z"]
@@ -530,7 +763,6 @@ class MoveEEControllerNode:
                 response.data = json.dumps({"success": False, "error": "Target distance too large"})
                 return response
 
-            # ---- WebSocket request ----
             ws_msg = self._build_ws_message(current_joints, target_pose)
             rospy.loginfo(f"Sending to WebSocket: {ws_msg[:100]}...")
             ws_raw, ws_err = self._send_ws(ws_msg)
@@ -540,7 +772,6 @@ class MoveEEControllerNode:
                 response.data = json.dumps({"success": False, "error": f"WebSocket: {ws_err}"})
                 return response
 
-            # ---- Parse trajectory ----
             traj_data, parse_err = self._parse_trajectory(ws_raw)
             if parse_err:
                 response.result_code.result_code = ResultCode.FAILURE
@@ -557,7 +788,6 @@ class MoveEEControllerNode:
 
             rospy.loginfo(f"Received trajectory with {len(waypoints)} waypoints")
 
-            # ---- Safety checks ----
             safe, safety_msg = self._check_waypoint_safety(waypoints)
             if not safe:
                 response.result_code.result_code = ResultCode.FAILURE
@@ -566,7 +796,6 @@ class MoveEEControllerNode:
                 return response
             rospy.loginfo("Safety check: position jump detection OK")
 
-            # ---- Publish waypoints with scaled timing ----
             raw_dt        = float(traj_data.get("metadata", {}).get("dt", 0.02))
             scaled_dt     = raw_dt * self.time_scale
             traj_duration = (len(waypoints) - 1) * scaled_dt
@@ -616,7 +845,6 @@ class MoveEEControllerNode:
                 desired_time = t_start_pub + idx * scaled_dt
                 sleep_time   = desired_time - time.time()
                 if sleep_time > 0:
-                    # sleep in small slices to allow guard checks at a reasonable frequency
                     slice_dt = 0.01
                     remaining = sleep_time
                     while remaining > 0 and not rospy.is_shutdown():
@@ -648,7 +876,6 @@ class MoveEEControllerNode:
                         "orientation": ori_dicts[idx],
                     }
                     if pose_dict["position"]["z"] <= 0.19:
-                        # if orientation is top-down (x near ±1) and (w near 0)
                         if abs(pose_dict["orientation"]["x"]) > 0.9 and abs(pose_dict["orientation"]["w"]) < 0.1:
                             rospy.logwarn(f"CAPPING Z to 0.19m to avoid unsafe trajectory at waypoint {idx}")
                             pose_dict["position"]["z"] = 0.19
@@ -665,8 +892,7 @@ class MoveEEControllerNode:
                 except (IndexError, TypeError, KeyError) as e:
                     rospy.logwarn(f"Error parsing waypoint {idx}: {e}")
                     continue
-            
-            # Check guard one last time after publishing all waypoints, before we start waiting for convergence.
+
             if guard_tripped:
                 cur_pose_now = self._get_current_pose_dict() or current_ee_pose
                 freeze_pose = {
@@ -675,8 +901,6 @@ class MoveEEControllerNode:
                                    if last_published_pose is not None
                                    else cur_pose_now["orientation"],
                 }
-                # Publish freeze pose several times to make sure the
-                # impedance controller latches onto it.
                 for _ in range(5):
                     if freeze_pose["position"]["z"] <= 0.19:
                         if abs(freeze_pose["orientation"]["x"]) > 0.9 and abs(freeze_pose["orientation"]["w"]) < 0.1:
@@ -691,9 +915,10 @@ class MoveEEControllerNode:
                     "message", "Trajectory cancelled by guard"
                 )
                 data_block = {
-                    "stop_reason":   guard_payload.get("stop_reason", "guard_triggered"),
-                    "stop_position": dict(cur_pose_now["position"]),
-                    "elapsed":       round(total_elapsed, 3),
+                    "stop_reason":     guard_payload.get("stop_reason", "guard_triggered"),
+                    "stop_position":   dict(cur_pose_now["position"]),
+                    "elapsed":         round(total_elapsed, 3),
+                    "contact_stopped": True,
                 }
                 for k, v in guard_payload.items():
                     if k not in ("message", "stop_reason"):
@@ -704,19 +929,17 @@ class MoveEEControllerNode:
                     "message":     response.result_code.message,
                     "data":        data_block,
                 })
-                return response
+                return self._maybe_override_with_reflex(response, t_total_start)
 
             rospy.loginfo(
                 f"Finished publishing {len(waypoints)} waypoints in "
                 f"{time.time() - t_start_pub:.2f}s"
             )
 
-            # ---- Convergence (guard-aware) ----
             reached, convergence_elapsed, guard_during_settle = \
                 self._wait_for_ee_convergence(target_pose, guard_callback=guard_callback)
             total_elapsed = time.time() - t_total_start
 
-            # Guard could still trip while we wait for settling
             if guard_during_settle is not None:
                 cur_pose_now = self._get_current_pose_dict() or current_ee_pose
                 freeze_pose = {
@@ -736,9 +959,10 @@ class MoveEEControllerNode:
                     "message", "Trajectory cancelled by guard during settling"
                 )
                 data_block = {
-                    "stop_reason":   guard_during_settle.get("stop_reason", "guard_triggered"),
-                    "stop_position": dict(cur_pose_now["position"]),
-                    "elapsed":       round(total_elapsed, 3),
+                    "stop_reason":     guard_during_settle.get("stop_reason", "guard_triggered"),
+                    "stop_position":   dict(cur_pose_now["position"]),
+                    "elapsed":         round(total_elapsed, 3),
+                    "contact_stopped": True,
                 }
                 for k, v in guard_during_settle.items():
                     if k not in ("message", "stop_reason"):
@@ -748,7 +972,7 @@ class MoveEEControllerNode:
                     "message":     response.result_code.message,
                     "data":        data_block,
                 })
-                return response
+                return self._maybe_override_with_reflex(response, t_total_start)
 
             if reached:
                 response.result_code.result_code = ResultCode.SUCCESS
@@ -760,9 +984,10 @@ class MoveEEControllerNode:
                     "elapsed_time": round(total_elapsed, 3),
                     "convergence_time": round(convergence_elapsed, 3),
                     "data": {
-                        "stop_reason":   "completed",
-                        "stop_position": dict(cur_pose_now["position"]),
-                        "elapsed":       round(total_elapsed, 3),
+                        "stop_reason":     "completed",
+                        "stop_position":   dict(cur_pose_now["position"]),
+                        "elapsed":         round(total_elapsed, 3),
+                        "contact_stopped": False,
                     },
                 })
                 rospy.loginfo(
@@ -770,25 +995,92 @@ class MoveEEControllerNode:
                     f"(convergence poll={convergence_elapsed:.2f}s)"
                 )
             else:
-                response.result_code.result_code = ResultCode.TIMEOUT
-                response.result_code.message     = (
-                    f"IK convergence timeout after {convergence_elapsed:.2f}s while waiting for EE to reach target pose"
-                )
+                # Convergence timeout. If contact-guarding is enabled, this
+                # almost always means the robot is being physically blocked
+                # (force ramped just below the guard threshold, or contact
+                # spread across multiple axes such that no single axis
+                # crossed its threshold). Treat as a successful contact
+                # stop rather than a failure, and freeze the equilibrium
+                # pose so the controller stops pulling against the obstacle.
                 cur_pose_now = self._get_current_pose_dict() or current_ee_pose
-                response.data = json.dumps({
-                    "success": False,
-                    "error": "Convergence timeout",
-                    "elapsed_time": round(total_elapsed, 3),
-                    "convergence_time": round(convergence_elapsed, 3),
-                    "data": {
-                        "stop_reason":   "timeout",
-                        "stop_position": dict(cur_pose_now["position"]),
-                        "elapsed":       round(total_elapsed, 3),
-                    },
-                })
-                rospy.logwarn(f"trajectory move TIMEOUT — total={total_elapsed:.2f}s")
 
-            return response
+                if guard_callback is not None:
+                    freeze_pose = {
+                        "position":    dict(cur_pose_now["position"]),
+                        "orientation": cur_pose_now["orientation"],
+                    }
+                    for _ in range(5):
+                        if freeze_pose["position"]["z"] <= 0.19:
+                            if (abs(freeze_pose["orientation"]["x"]) > 0.9 and
+                                    abs(freeze_pose["orientation"]["w"]) < 0.1):
+                                freeze_pose["position"]["z"] = 0.19
+                        self.pose_pub.publish(self._create_pose_stamped(freeze_pose))
+                        rospy.sleep(0.02)
+
+                    # Snapshot the current force reading for diagnostics
+                    force_snapshot = None
+                    if self.latest_force is not None:
+                        f_base = {
+                            "x": self.latest_force[0],
+                            "y": self.latest_force[1],
+                            "z": self.latest_force[2],
+                        }
+                        try:
+                            f_ee = self._rotate_vector_by_quaternion_inverse(
+                                f_base, cur_pose_now["orientation"]
+                            )
+                        except Exception:
+                            f_ee = None
+                        force_snapshot = {
+                            "contact_force":    f_base,
+                            "contact_force_ee": f_ee,
+                        }
+
+                    msg = (
+                        f"Trajectory stalled before reaching target "
+                        f"({convergence_elapsed:.2f}s); inferring contact "
+                        f"since guard is enabled."
+                    )
+                    rospy.logwarn(f"[Trajectory] {msg}")
+
+                    response.result_code.result_code = ResultCode.SUCCESS
+                    response.result_code.message     = msg
+                    data_block = {
+                        "stop_reason":     "contact_inferred",
+                        "stop_position":   dict(cur_pose_now["position"]),
+                        "elapsed":         round(total_elapsed, 3),
+                        "contact_stopped": True,
+                    }
+                    if force_snapshot is not None:
+                        data_block.update(force_snapshot)
+
+                    response.data = json.dumps({
+                        "success":          True,
+                        "message":          msg,
+                        "elapsed_time":     round(total_elapsed, 3),
+                        "convergence_time": round(convergence_elapsed, 3),
+                        "data":             data_block,
+                    })
+                else:
+                    response.result_code.result_code = ResultCode.TIMEOUT
+                    response.result_code.message     = (
+                        f"IK convergence timeout after {convergence_elapsed:.2f}s while waiting for EE to reach target pose"
+                    )
+                    response.data = json.dumps({
+                        "success": False,
+                        "error": "Convergence timeout",
+                        "elapsed_time": round(total_elapsed, 3),
+                        "convergence_time": round(convergence_elapsed, 3),
+                        "data": {
+                            "stop_reason":     "timeout",
+                            "stop_position":   dict(cur_pose_now["position"]),
+                            "elapsed":         round(total_elapsed, 3),
+                            "contact_stopped": False,
+                        },
+                    })
+                    rospy.logwarn(f"trajectory move TIMEOUT — total={total_elapsed:.2f}s")
+
+            return self._maybe_override_with_reflex(response, t_total_start)
 
         except Exception as e:
             rospy.logerr(f"Unexpected error in _execute_trajectory_to_pose: {traceback.format_exc()}")
@@ -801,10 +1093,6 @@ class MoveEEControllerNode:
             self._traj_lock.release()
 
     def _get_current_joints(self):
-        """
-        Get current joint state (9 values: 7 arm + 2 gripper) via service.
-        Returns list[float] or None on failure.
-        """
         try:
             resp = self._current_joints_proxy()
         except rospy.ServiceException as e:
@@ -831,10 +1119,6 @@ class MoveEEControllerNode:
             return None
 
     def _get_ee_pose(self):
-        """
-        Get current EE pose from proprioception service.
-        Returns dict {"position": {x,y,z}, "orientation": {x,y,z,w}} or None.
-        """
         try:
             resp = self._ee_pose_proxy()
         except rospy.ServiceException as e:
@@ -848,7 +1132,7 @@ class MoveEEControllerNode:
         try:
             data    = json.loads(resp.data)
             ee_pose = data["ee_pose"]
-            _       = ee_pose["position"]["x"]   # validate structure
+            _       = ee_pose["position"]["x"]
             _       = ee_pose["orientation"]["w"]
             return ee_pose
         except (json.JSONDecodeError, KeyError) as e:
@@ -856,10 +1140,6 @@ class MoveEEControllerNode:
             return None
 
     def _build_ws_message(self, current_joints, target_pose):
-        """
-        Build WebSocket message for the motion server.
-        Format: "<j1..j7> <finger1> <finger2>  <tx> <ty> <tz> <tqw> <tqx> <tqy> <tqz>"
-        """
         sp = current_joints
         tp = target_pose["position"]
         to = target_pose["orientation"]
@@ -870,7 +1150,6 @@ class MoveEEControllerNode:
         )
 
     async def _ws_communicate(self, message):
-        """Async WebSocket send/receive."""
         uri = f"ws://{self.ws_host}:{self.ws_port}/ws"
         rospy.loginfo(f"WebSocket connecting to {uri} ...")
         try:
@@ -890,10 +1169,6 @@ class MoveEEControllerNode:
             raise RuntimeError(f"WebSocket connection refused at {uri}: {e}")
 
     def _send_ws(self, message):
-        """
-        Synchronous wrapper around async WebSocket call.
-        Returns (response_str, None) on success or (None, error_str) on failure.
-        """
         if not _WEBSOCKETS_OK:
             return None, "aiohttp not installed (pip install aiohttp)"
         try:
@@ -908,11 +1183,6 @@ class MoveEEControllerNode:
             return None, str(e)
 
     def _parse_trajectory(self, ws_response_str):
-        """
-        Parse WebSocket JSON response into trajectory dict.
-        Accepts a top-level 'trajectory' key or direct trajectory data.
-        Returns (traj_dict, None) or (None, error_string).
-        """
         try:
             data = json.loads(ws_response_str)
         except json.JSONDecodeError as e:
@@ -927,10 +1197,6 @@ class MoveEEControllerNode:
         return data, None
 
     def _check_waypoint_safety(self, waypoints):
-        """
-        Validate that position jumps between consecutive waypoints are within tolerance.
-        Returns (True, None) or (False, error_string).
-        """
         for i in range(1, len(waypoints)):
             prev_pos = waypoints[i - 1].get("position", [0, 0, 0])
             curr_pos = waypoints[i].get("position", [0, 0, 0])
@@ -951,28 +1217,10 @@ class MoveEEControllerNode:
     # =========================================================================
 
     def _wait_for_ee_convergence(self, target_pose, guard_callback=None):
-        """
-        Poll EE pose until convergence or timeout. Uses the franka_states
-        topic data (self.latest_o_tee) directly — no service calls.
-
-        Two acceptance conditions (either succeeds):
-          (1) STRICT: position error <= position_tolerance.
-          (2) SETTLED: position error <= settle_position_tolerance AND
-              EE speed < settle_velocity_threshold for settle_samples
-              consecutive polls. This handles compliant impedance
-              controllers that have a non-zero steady-state error.
-
-        If guard_callback is provided, it is called every poll. If it returns
-        (True, payload), the function aborts and returns
-        (False, elapsed, payload). Otherwise the third element is None.
-
-        Returns (reached: bool, elapsed: float, guard_payload: dict|None)
-        """
         t_start    = time.time()
         timeout_at = t_start + self.traj_buffer + self.ee_convergence_timeout
-        poll_dt    = 0.05  # 20 Hz
+        poll_dt    = 0.05
 
-        # compensate for capping z <0.19m to avoid unsafe trajectories
         if target_pose["position"]["z"] < 0.19:
             if abs(target_pose["orientation"]["x"]) > 0.9 and abs(target_pose["orientation"]["w"]) < 0.1:
                 rospy.logwarn(f"Convergence check: CAPPING target Z to 0.19m to avoid unsafe trajectory")
@@ -985,11 +1233,9 @@ class MoveEEControllerNode:
         settled_count = 0
         last_speed    = float("nan")
 
-        # Brief grace period so the controller starts tracking before we judge
         time.sleep(min(self.traj_buffer, 0.2))
 
         while time.time() < timeout_at and not rospy.is_shutdown():
-            # Guard check
             if guard_callback is not None:
                 try:
                     triggered, payload = guard_callback()
@@ -1016,7 +1262,6 @@ class MoveEEControllerNode:
             if pos_error < min_error:
                 min_error = pos_error
 
-            # (1) Strict convergence
             if pos_error <= self.position_tolerance:
                 elapsed = time.time() - t_start
                 rospy.loginfo(
@@ -1025,7 +1270,6 @@ class MoveEEControllerNode:
                 )
                 return True, elapsed, None
 
-            # (2) Settling check — needs a previous sample for velocity
             now = time.time()
             if prev_pos is not None and prev_t is not None:
                 dt = now - prev_t
@@ -1064,6 +1308,161 @@ class MoveEEControllerNode:
         return False, elapsed, None
 
     # =========================================================================
+    # Contact-guard helpers (shared by pose/rel_pose/guarded services)
+    # =========================================================================
+
+    def _parse_guard_options(self, data, default_axes=("x", "y", "z")):
+        """
+        Parse optional contact-guard fields from a request JSON dict.
+
+        Recognised fields:
+          guard            (bool)            : enable contact guarding (default False)
+          force_threshold  (number or dict)  : N. A scalar applies to all
+                                               monitored axes; a dict
+                                               {x:.., y:.., z:..} sets per-axis
+                                               thresholds. Missing axes fall
+                                               back to self.default_force_threshold.
+          guard_axes       (list[str])       : subset of ["x","y","z"] to monitor.
+                                               Defaults to default_axes.
+
+        Returns (guard_enabled, per_axis_thresholds_dict, monitored_axes_tuple).
+        Raises ValueError on malformed input.
+        """
+        guard_enabled = bool(data.get("guard", False))
+
+        # Axes
+        axes_in = data.get("guard_axes", list(default_axes))
+        if not isinstance(axes_in, (list, tuple)):
+            raise ValueError("'guard_axes' must be a list of axis names")
+        monitored_axes = []
+        for a in axes_in:
+            a_norm = str(a).lower().strip()
+            if a_norm not in AXIS_TO_IDX:
+                raise ValueError(f"Invalid axis '{a}' in guard_axes; must be x/y/z")
+            if a_norm not in monitored_axes:
+                monitored_axes.append(a_norm)
+        if not monitored_axes:
+            raise ValueError("'guard_axes' must contain at least one axis")
+
+        # Thresholds — start from defaults, override from request
+        thresholds = dict(self.default_force_threshold)
+        ft_in = data.get("force_threshold", None)
+        if ft_in is not None:
+            if isinstance(ft_in, dict):
+                for a, v in ft_in.items():
+                    a_norm = str(a).lower().strip()
+                    if a_norm not in AXIS_TO_IDX:
+                        raise ValueError(
+                            f"Invalid axis '{a}' in force_threshold dict"
+                        )
+                    try:
+                        fv = float(v)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"force_threshold['{a}'] must be a number: {exc}"
+                        ) from exc
+                    if fv <= 0:
+                        raise ValueError(
+                            f"force_threshold['{a}'] must be positive"
+                        )
+                    thresholds[a_norm] = fv
+            else:
+                try:
+                    fv = float(ft_in)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"'force_threshold' must be a number or dict: {exc}"
+                    ) from exc
+                if fv <= 0:
+                    raise ValueError("'force_threshold' must be positive")
+                for a in monitored_axes:
+                    thresholds[a] = fv
+
+        return guard_enabled, thresholds, tuple(monitored_axes)
+
+    def _build_contact_guard(self, monitored_axes, thresholds, fallback_orientation=None):
+        """
+        Build a guard callback that monitors EE-frame (or base-frame) external
+        forces on the given axes and trips when any one exceeds its threshold.
+
+        monitored_axes      : iterable of "x"/"y"/"z"
+        thresholds          : dict {axis: N}
+        fallback_orientation: orientation dict to use if the current EE pose
+                              is momentarily unavailable. Optional.
+
+        Returns a zero-arg callable returning (triggered, payload). The payload
+        on contact mirrors the shape historically used by move_ee_guarded:
+          stop_reason     : "contact"
+          axis            : axis that triggered
+          force_threshold : threshold that was exceeded (N)
+          force_frame     : "ee" or "base"
+          force_on_axis   : signed force on the triggering axis
+          contact_force   : base-frame force {x,y,z}
+          contact_force_ee: ee-frame force   {x,y,z}
+          message         : human-readable description
+          monitored_axes  : list of axes that were being watched
+        """
+        if not monitored_axes:
+            # Disabled guard: never trips
+            def _noop():
+                return False, {}
+            return _noop
+
+        guard_frame = self.guard_force_frame
+        axis_indices = [(a, AXIS_TO_IDX[a]) for a in monitored_axes]
+
+        def _guard_check():
+            if not self.has_force_data or self.latest_force is None:
+                return False, {}
+
+            f_base = {
+                "x": self.latest_force[0],
+                "y": self.latest_force[1],
+                "z": self.latest_force[2],
+            }
+
+            cur_pose = self._get_current_pose_dict()
+            if cur_pose is not None:
+                ee_ori = cur_pose["orientation"]
+            elif fallback_orientation is not None:
+                ee_ori = fallback_orientation
+            else:
+                # Without orientation we can't transform to EE frame; bail safely.
+                return False, {}
+
+            f_ee = self._rotate_vector_by_quaternion_inverse(f_base, ee_ori)
+
+            for axis, idx in axis_indices:
+                if guard_frame == "ee":
+                    axis_val = (f_ee["x"], f_ee["y"], f_ee["z"])[idx]
+                else:
+                    axis_val = (f_base["x"], f_base["y"], f_base["z"])[idx]
+
+                thr = thresholds.get(axis, self.default_force_threshold[axis])
+                if abs(axis_val) >= thr:
+                    msg = (
+                        f"Contact detected on axis '{axis}' "
+                        f"(|F|={abs(axis_val):.2f} N >= threshold {thr:.1f} N, "
+                        f"frame={guard_frame})"
+                    )
+                    rospy.loginfo(f"[ContactGuard] {msg}")
+                    return True, {
+                        "stop_reason":      "contact",
+                        "axis":             axis,
+                        "force_threshold":  thr,
+                        "force_frame":      guard_frame,
+                        "force_on_axis":    axis_val,
+                        "contact_force":    f_base,
+                        "contact_force_ee": f_ee,
+                        "monitored_axes":   list(monitored_axes),
+                        "message":          msg,
+                    }
+
+            return False, {}
+
+        return _guard_check
+
+    # =========================================================================
     # Service Handlers
     # =========================================================================
 
@@ -1071,10 +1470,14 @@ class MoveEEControllerNode:
         """
         /robot/control/move_ee_to_pose — absolute pose via WebSocket trajectory.
 
-        Automatically applies a backward shift of `gripper_shift_m` along the
-        target's local -Z axis (gripper approach axis). The shift can be
-        overridden per call by including "gripper_shift" (meters) in the
-        request JSON; pass 0.0 to disable for that call.
+        JSON request fields:
+          target_pose      (dict, required)    : {"position": {...}, "orientation": {...}}
+          guard            (bool, optional)    : enable contact-guarded motion
+          force_threshold  (number|dict, opt.) : N. Scalar or per-axis dict.
+          guard_axes       (list, optional)    : subset of ["x","y","z"]; default all.
+
+        On contact: result_code = SUCCESS, response.data.data.stop_reason = "contact",
+        data.contact_stopped = True, plus the usual contact payload.
         """
         response = RobotCommandResponse()
         rospy.loginfo(f"move_ee_to_pose request: {req.req}")
@@ -1092,10 +1495,23 @@ class MoveEEControllerNode:
             if "w" not in target_pose.get("orientation", {}):
                 raise ValueError("Missing 'w' in orientation")
             shift_m = 0.18
+
+            guard_enabled, thresholds, monitored_axes = self._parse_guard_options(data)
         except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
             response.result_code.result_code = ResultCode.INVALID_INPUT
             response.result_code.message     = f"Bad request: {e}"
             response.data = json.dumps({"success": False, "error": str(e)})
+            return response
+
+        # Refuse to guard if we never received F_ext data — quietly disable
+        # would mask a hardware problem.
+        if guard_enabled and not self.has_force_data:
+            response.result_code.result_code = ResultCode.SERVICE_NOT_RUNNING
+            response.result_code.message     = "F_ext data not available — cannot guard"
+            response.data = json.dumps({
+                "success": False,
+                "error":   "Force data not available",
+            })
             return response
 
         if shift_m != 0.0:
@@ -1111,17 +1527,25 @@ class MoveEEControllerNode:
             )
             target_pose = shifted
 
-        return self._execute_trajectory_to_pose(target_pose)
+        guard_callback = None
+        if guard_enabled:
+            rospy.loginfo(
+                f"[move_ee_to_pose] Contact guarding ENABLED  "
+                f"axes={list(monitored_axes)} thresholds={ {a: thresholds[a] for a in monitored_axes} } "
+                f"frame={self.guard_force_frame}"
+            )
+            guard_callback = self._build_contact_guard(
+                monitored_axes, thresholds,
+                fallback_orientation=target_pose["orientation"],
+            )
+
+        return self._execute_trajectory_to_pose(target_pose, guard_callback=guard_callback)
 
     # -------------------------------------------------------------------------
     # /robot/control/move_ee_to_rel_pose
     # -------------------------------------------------------------------------
 
     def _parse_delta_position(self, req_json):
-        """
-        Parse {"delta_position": {"x": float, "y": float, "z": float}}.
-        Returns validated delta dict.
-        """
         data = json.loads(req_json)
         if "delta_position" not in data:
             raise ValueError("Missing 'delta_position'")
@@ -1135,25 +1559,29 @@ class MoveEEControllerNode:
 
     def _handle_move_ee_to_rel_pose(self, req):
         """
-        /robot/control/move_ee_to_rel_pose — applies delta in the END-EFFECTOR
-        frame.
+        /robot/control/move_ee_to_rel_pose — applies delta in the EE frame.
 
-        The requested (x, y, z) delta is rotated by the current EE orientation
-        so that, e.g., +z always moves along the gripper's approach axis,
-        regardless of how the EE is currently posed in the base frame.
-        Orientation is preserved, and the resulting absolute pose is executed
-        through the same WebSocket trajectory pipeline as
-        /robot/control/move_ee_to_pose.
+        JSON request fields:
+          delta_position   (dict, required)    : {"x":..., "y":..., "z":...} in EE frame
+          guard            (bool, optional)    : enable contact-guarded motion
+          force_threshold  (number|dict, opt.) : N. Scalar or per-axis dict.
+          guard_axes       (list, optional)    : subset of ["x","y","z"]; default all.
+
+        On contact: result_code = SUCCESS, response.data.data.stop_reason = "contact",
+        data.contact_stopped = True, plus the usual contact payload.
         """
         response = RobotCommandResponse()
 
         try:
-            delta_ee = self._parse_delta_position(req.req)
+            data_in   = json.loads(req.req)
+            delta_ee  = self._parse_delta_position(req.req)
+            guard_enabled, thresholds, monitored_axes = self._parse_guard_options(data_in)
         except (json.JSONDecodeError, ValueError, KeyError) as e:
             response.result_code.result_code = ResultCode.INVALID_INPUT
             response.result_code.message     = f"Bad request: {e}"
             response.data = json.dumps({"success": False, "error": str(e)})
             return response
+
         delta_ee["y"] = -delta_ee["y"]
         delta_ee["z"] = -delta_ee["z"]
 
@@ -1163,6 +1591,15 @@ class MoveEEControllerNode:
             response.data = json.dumps({"success": False, "error": "Robot not connected"})
             return response
 
+        if guard_enabled and not self.has_force_data:
+            response.result_code.result_code = ResultCode.SERVICE_NOT_RUNNING
+            response.result_code.message     = "F_ext data not available — cannot guard"
+            response.data = json.dumps({
+                "success": False,
+                "error":   "Force data not available",
+            })
+            return response
+
         current_pose = self._get_current_pose_dict()
         if current_pose is None:
             response.result_code.result_code = ResultCode.SERVICE_NOT_RUNNING
@@ -1170,7 +1607,6 @@ class MoveEEControllerNode:
             response.data = json.dumps({"success": False, "error": "Current EE pose unavailable"})
             return response
 
-        # EE-frame delta -> base-frame delta using current EE orientation
         delta_base = self._rotate_vector_by_quaternion(delta_ee, current_pose["orientation"])
 
         target_pose = {
@@ -1179,7 +1615,6 @@ class MoveEEControllerNode:
                 "y": current_pose["position"]["y"] + delta_base["y"],
                 "z": current_pose["position"]["z"] + delta_base["z"],
             },
-            # Orientation unchanged
             "orientation": current_pose["orientation"],
         }
 
@@ -1195,37 +1630,36 @@ class MoveEEControllerNode:
             f"{target_pose['position']['z']:.3f})"
         )
 
-        return self._execute_trajectory_to_pose(target_pose)
+        guard_callback = None
+        if guard_enabled:
+            rospy.loginfo(
+                f"[move_ee_to_rel_pose] Contact guarding ENABLED  "
+                f"axes={list(monitored_axes)} thresholds={ {a: thresholds[a] for a in monitored_axes} } "
+                f"frame={self.guard_force_frame}"
+            )
+            guard_callback = self._build_contact_guard(
+                monitored_axes, thresholds,
+                fallback_orientation=current_pose["orientation"],
+            )
+
+        return self._execute_trajectory_to_pose(target_pose, guard_callback=guard_callback)
 
     # -------------------------------------------------------------------------
     # /robot/control/move_ee_guarded
     # -------------------------------------------------------------------------
 
     def _parse_guarded_request(self, req_json):
-        """
-        Parse and validate the guarded-move JSON request string.
-
-        Returns (axis, distance, force_threshold) or raises ValueError.
-
-        JSON request fields:
-          axis             (str)   : "x", "y", or "z"   [required]
-          distance         (float) : signed metres to travel [required]
-          force_threshold  (float) : N, magnitude on the monitored axis
-                                     (default: per-axis ROS param)
-        """
         try:
             data = json.loads(req_json)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid JSON: {exc}") from exc
 
-        # ── axis ─────────────────────────────────────────────────────────────
         if "axis" not in data:
             raise ValueError("Missing required field 'axis'")
         axis = str(data["axis"]).lower().strip()
         if axis not in AXIS_TO_IDX:
             raise ValueError(f"'axis' must be 'x', 'y', or 'z'; got '{axis}'")
 
-        # ── distance ─────────────────────────────────────────────────────────
         if "distance" not in data:
             raise ValueError("Missing required field 'distance'")
         try:
@@ -1235,7 +1669,6 @@ class MoveEEControllerNode:
         if distance == 0.0:
             raise ValueError("'distance' must be non-zero")
 
-        # ── optional force_threshold ─────────────────────────────────────────
         if "force_threshold" in data:
             try:
                 force_threshold = float(data["force_threshold"])
@@ -1252,26 +1685,12 @@ class MoveEEControllerNode:
 
     def _handle_move_ee_guarded(self, req):
         """
-        /robot/control/move_ee_guarded — move along a single axis (EE frame)
-        by *distance* metres, aborting the trajectory if the measured
-        external force on that axis exceeds *force_threshold*.
-
-        Uses the same WebSocket trajectory planner as move_ee_to_rel_pose;
-        the difference is that publishing is cancelled mid-flight if the
-        guard trips. On contact the equilibrium pose is frozen at the
-        current EE position so the controller stops pulling.
-
-        JSON response data fields:
-          stop_reason   : "contact" | "completed" | "timeout" | "error"
-          axis          : axis that was monitored
-          stop_position : {x, y, z} EE position when motion ended
-          elapsed       : seconds elapsed
-          contact_force : (only on contact) force vector {x, y, z}
+        /robot/control/move_ee_guarded — single-axis guarded move.
+        Now implemented in terms of the shared _build_contact_guard helper.
         """
         response = RobotCommandResponse()
         rospy.loginfo(f"move_ee_guarded request: {req.req}")
 
-        # ── readiness guards ─────────────────────────────────────────────────
         if not self.has_received_data:
             response.result_code.result_code = ResultCode.SERVICE_NOT_RUNNING
             response.result_code.message     = "Robot state not available (no /franka_states data)"
@@ -1290,7 +1709,6 @@ class MoveEEControllerNode:
             })
             return response
 
-        # ── parse request ────────────────────────────────────────────────────
         try:
             axis, distance, force_threshold = self._parse_guarded_request(req.req)
         except ValueError as exc:
@@ -1339,64 +1757,16 @@ class MoveEEControllerNode:
             f"{target_pose['position']['z']:.4f})"
         )
 
-        # ── build the guard callback ─────────────────────────────────────────
-        axis_idx        = AXIS_TO_IDX[axis]
-        guard_force_frame = self.guard_force_frame
+        # Build single-axis guard using the shared helper
+        thresholds = dict(self.default_force_threshold)
+        thresholds[axis] = force_threshold
+        guard_callback = self._build_contact_guard(
+            (axis,), thresholds,
+            fallback_orientation=current_pose["orientation"],
+        )
 
-        def _guard_check():
-            """
-            Returns (triggered: bool, payload: dict).
-
-            payload (when triggered):
-              stop_reason      : "contact"
-              axis             : monitored axis
-              force_threshold  : threshold used
-              force_on_axis    : signed force on the monitored axis (frame as configured)
-              contact_force    : base-frame force vector {x,y,z}
-              contact_force_ee : ee-frame force vector {x,y,z}
-              message          : human-readable
-            """
-            if not self.has_force_data or self.latest_force is None:
-                return False, {}
-
-            f_base = {
-                "x": self.latest_force[0],
-                "y": self.latest_force[1],
-                "z": self.latest_force[2],
-            }
-
-            ee_ori = (self._get_current_pose_dict()
-                      or current_pose)["orientation"]
-            f_ee = self._rotate_vector_by_quaternion_inverse(f_base, ee_ori)
-
-            if guard_force_frame == "ee":
-                axis_val = (f_ee["x"], f_ee["y"], f_ee["z"])[axis_idx]
-            else:
-                axis_val = (f_base["x"], f_base["y"], f_base["z"])[axis_idx]
-
-            if abs(axis_val) >= force_threshold:
-                msg = (
-                    f"Contact detected on axis '{axis}' "
-                    f"(|F|={abs(axis_val):.2f} N >= threshold {force_threshold:.1f} N, "
-                    f"frame={guard_force_frame})"
-                )
-                rospy.loginfo(f"[GuardedMove] {msg}")
-                return True, {
-                    "stop_reason":     "contact",
-                    "axis":            axis,
-                    "force_threshold": force_threshold,
-                    "force_frame":     guard_force_frame,
-                    "force_on_axis":   axis_val,
-                    "contact_force":   f_base,
-                    "contact_force_ee": f_ee,
-                    "message":         msg,
-                }
-
-            return False, {}
-
-        # ── execute via the shared trajectory pipeline ──────────────────────
         traj_response = self._execute_trajectory_to_pose(
-            target_pose, guard_callback=_guard_check
+            target_pose, guard_callback=guard_callback
         )
 
         try:
@@ -1425,15 +1795,9 @@ class MoveEEControllerNode:
     # -------------------------------------------------------------------------
 
     def _set_gripper_open(self):
-        """
-        Helper method to set the gripper to open position after reset.
-        Returns a RobotCommandResponse.
-        """
         response = RobotCommandResponse()
         try:
-            # Assuming the gripper open position corresponds to 0.04m for both fingers
             gripper_open_position = 0.085
-            # rosservice call /robot/control/set_gripper_width '{"req": "{\"width\": 0.085}"}'
             req_json = json.dumps({"width": gripper_open_position})
             set_gripper_resp = self._set_gripper_width_proxy(req_json)
             response.result_code = set_gripper_resp.result_code
@@ -1449,16 +1813,60 @@ class MoveEEControllerNode:
             response.data = json.dumps({"success": False, "error": str(e)})
         return response
 
-    def _handle_reset_robot(self, req):
+    def _handle_recover_from_reflex(self, req):
         """
-        /robot/control/reset_robot — move to hard-coded home pose using the
-        same WebSocket / curobo trajectory pipeline as move_ee_to_pose.
+        /robot/control/recover_from_reflex — manually clear a Franka reflex /
+        error state.
 
-        Internally this forwards a RobotCommand request to
-        _handle_move_ee_to_pose with gripper_shift=0.0 (the home pose
-        is already the desired TCP pose, not a grasp pose, so no
-        approach-axis offset is applied).
+        Always: freeze the equilibrium pose at the current EE position so the
+        impedance controller doesn't snap back to the previous goal, then call
+        the franka_control/error_recovery action. Returns success unless the
+        action call itself failed.
+
+        Useful for:
+          - calling explicitly after a hard contact, instead of relying on
+            the background watchdog
+          - clearing USER_STOPPED state after the user-stop button is released
+          - operator scripts that want a known recovery point
         """
+        response = RobotQueryResponse()
+        try:
+            cur_pose = self._get_current_pose_dict()
+            mode_before = self.latest_robot_mode
+
+            self._freeze_equilibrium_pose_here()
+            ok, msg = self._send_error_recovery(wait=True)
+            self._freeze_equilibrium_pose_here(n_publishes=3, sleep_s=0.02)
+
+            data = {
+                "robot_mode_before": mode_before,
+                "robot_mode_after":  self.latest_robot_mode,
+                "reflex_count":      self.reflex_count,
+                "current_position":  dict(cur_pose["position"]) if cur_pose else None,
+                "action_message":    msg,
+            }
+
+            if ok:
+                response.result_code.result_code = ResultCode.SUCCESS
+                response.result_code.message     = msg
+                response.data = json.dumps({"success": True, "message": msg, "data": data})
+            else:
+                response.result_code.result_code = ResultCode.FAILURE
+                response.result_code.message     = msg
+                response.data = json.dumps({"success": False, "error": msg, "data": data})
+            return response
+
+        except Exception as e:
+            rospy.logerr(
+                f"Unexpected error in _handle_recover_from_reflex: "
+                f"{traceback.format_exc()}"
+            )
+            response.result_code.result_code = ResultCode.FAILURE
+            response.result_code.message     = str(e)
+            response.data = json.dumps({"success": False, "error": str(e)})
+            return response
+
+    def _handle_reset_robot(self, req):
         response = RobotQueryResponse()
         try:
             if not self.has_received_data:
@@ -1472,7 +1880,6 @@ class MoveEEControllerNode:
             }
 
             class _ReqShim:
-                """Minimal stand-in for a RobotCommand service request."""
                 __slots__ = ("req",)
                 def __init__(self, req_str):
                     self.req = req_str
@@ -1495,7 +1902,6 @@ class MoveEEControllerNode:
                 })
                 return response
 
-            # set gripper to open after reset
             gripper_cmd_res = self._set_gripper_open()
             if gripper_cmd_res.result_code.result_code != ResultCode.SUCCESS:
                 rospy.logwarn("Failed to open gripper after reset: " + gripper_cmd_res.result_code.message)
